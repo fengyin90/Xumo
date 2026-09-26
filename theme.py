@@ -476,6 +476,62 @@ QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
 QScrollBar:horizontal {{ background: transparent; height: 10px; }}
 QScrollBar::handle:horizontal {{ background: {p["rule"]}; min-width: 40px; margin: 3px 2px; }}
 
+/* ── 统计表：列表式，不设网格线 ── */
+QTableWidget {{
+    background: transparent; border: none; outline: none;
+    gridline-color: transparent;
+}}
+QTableWidget::item {{
+    padding: 6px 8px;
+    color: {p["text_dim"]};
+    font-size: 12px;
+    border-bottom: 1px solid {p["rule_soft"]};
+}}
+QTableWidget::item:hover {{ color: {p["text"]}; }}
+QTableWidget::item:selected {{ background: {p["hover"]}; color: {p["text"]}; }}
+QHeaderView::section {{
+    background: transparent;
+    border: none;
+    border-bottom: 1px solid {p["rule"]};
+    padding: 4px 8px;
+    font-size: 10px;
+    font-weight: 700;
+    color: {p["text_faint"]};
+    letter-spacing: 1px;
+}}
+QProgressBar {{
+    background: {p["hover"]};
+    border: none;
+    height: 15px;
+    text-align: center;
+    color: {p["text"]};
+    font-size: 10px;
+}}
+QProgressBar::chunk {{ background: {p["accent_dim"]}; }}
+
+/* ── 统计数字：用衬线，与普通标签区分开 ── */
+QLabel#StatValue {{
+    font-family: {SERIF};
+    font-size: 16px;
+    font-weight: 600;
+    color: {p["text"]};
+}}
+
+/* ── 通用列表（历史版本等弹出面板）── */
+QListWidget#Plain {{
+    background: transparent;
+    border: 1px solid {p["rule"]};
+    outline: none;
+}}
+QListWidget#Plain::item {{
+    padding: 7px 9px;
+    color: {p["text_dim"]};
+    border-bottom: 1px solid {p["rule_soft"]};
+    font-size: 12px;
+}}
+QListWidget#Plain::item:hover {{ background: {p["hover"]}; color: {p["text"]}; }}
+QListWidget#Plain::item:selected {{ background: {p["hover"]}; color: {p["accent"]}; }}
+
 /* ── 其它 ── */
 QToolTip {{
     background: {p["input_bg"]}; color: {p["text"]};
@@ -492,7 +548,3 @@ QCheckBox::indicator {{
 }}
 QCheckBox::indicator:checked {{ background: {p["accent"]}; border-color: {p["accent"]}; }}
 """
-
-
-def label_of_palette(name: str) -> str:
-    return PALETTES.get(name, {}).get("label", name)

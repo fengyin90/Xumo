@@ -15,7 +15,7 @@ import urllib.error
 import urllib.request
 from typing import Callable, Iterator
 
-from store import Chapter, Corpus, Project, Settings
+from store import Corpus, Project, Settings
 
 TIMEOUT = 180
 
@@ -33,15 +33,24 @@ SYSTEM_PROMPT = """你是一位职业小说家，正在为一部已成稿的长�
 1. 直接输出正文，不要任何解释、标题、序号或 Markdown 标记。
 2. 严格延续既有的人称、时态、语气、句法密度与段落节奏。
 3. 人物的名字、称谓、口癖、关系与设定必须与前文完全一致，不得凭空增改。
-   境界、修为、身份、地名、专有名词也必须与【作品简报】和前文一致，不得前后矛盾。
-4. 推进情节：让这一段落产生新的信息、动作或转折，不要复述前文。
+   境界、修为、身份、地名、专有名词也必须与【作品设定】和前文一致，不得前后矛盾。
+4. 这一段必须「有事发生」：有人想要某样东西、撞上阻碍、做出反应，局面随之改变。
+   用概述、回忆、风景或心理独白填满篇幅而不改变局面 —— 那是凑字数，不是推进。
 5. 段落必须短。每个自然段只写 1 到 3 句，通常不超过 80 字。
    对话必须独立成段，不得与叙述混在同一段里。
    叙述也要勤换段：动作、心理、环境各占一段，不要堆成一坨。
-6. 本次输出 5 到 10 个自然段，在一个完整的句子处自然收束。
+6. 收尾不许总结、不许升华、不许用写景或抒情把情绪收干净。
+   停在动作、悬念、反转或一句有分量的台词上 —— 让读者非看下一句不可。
 7. 使用中文全角标点，对话使用中文引号。
 8. 时间、地点与在场人物必须与紧邻上文完全一致：已经离场的人不得凭空出现，
-   一直在场的人不得写成「刚刚赶到」；不得在同一段之内让昼夜来回跳跃。"""
+   一直在场的人不得写成「刚刚赶到」；不得在同一段之内让昼夜来回跳跃。
+9. 写完这一段，读者必须比读之前多知道一件事，或者多了一个想知道答案的问题。"""
+
+
+# 单次续写的篇幅（自然段数）。
+# 提示词里只许有这一处定义：从前系统提示写「5 到 10 段」、装配上下文时又写
+# 「2 到 4 段」，同一次请求里塞进两个互相矛盾的篇幅指令，模型无所适从。
+PARAS_MIN, PARAS_MAX = 4, 8
 
 
 # ── 补全设定：把作者给的大纲扩写成完整设定 ──────────────
@@ -79,17 +88,48 @@ def _headers(s: Settings) -> dict[str, str]:
     return h
 
 
-def _payload(s: Settings, messages: list[dict], stream: bool, max_tokens: int | None = None) -> bytes:
-    return json.dumps(
-        {
-            "model": s.model,
-            "messages": messages,
-            "temperature": s.temperature,
-            "max_tokens": max_tokens or s.max_tokens,
-            "stream": stream,
-        },
-        ensure_ascii=False,
-    ).encode("utf-8")
+# ── 采样惩罚项 ──────────────────────────────────────────
+# 网关对不认识的参数态度不一：有的忽略，有的直接 400。
+# 所以这里只发「非默认值」—— 全默认时请求体与旧版逐字节一致，
+# 老配置不会因为升级而突然调不通。
+_SAMPLING_DEFAULTS = {"presence_penalty": 0.0, "frequency_penalty": 0.0, "top_p": 1.0}
+# 一旦确认网关不吃这些参数，本次会话内不再重试（见 _open）
+_sampling_ok = True
+
+
+def _sampling(s: Settings) -> dict:
+    """取出非默认的采样项。空 dict = 一个都不发。"""
+    if not _sampling_ok:
+        return {}
+    out: dict[str, float] = {}
+    for key, dflt in _SAMPLING_DEFAULTS.items():
+        try:
+            v = float(getattr(s, key, dflt))
+        except (TypeError, ValueError):
+            continue
+        if abs(v - dflt) > 1e-6:
+            out[key] = round(v, 2)
+    return out
+
+
+def _payload(
+    s: Settings,
+    messages: list[dict],
+    stream: bool,
+    max_tokens: int | None = None,
+    sampling: bool = True,
+    temperature: float | None = None,
+) -> bytes:
+    body: dict = {
+        "model": s.model,
+        "messages": messages,
+        "temperature": s.temperature if temperature is None else temperature,
+        "max_tokens": max_tokens or s.max_tokens,
+        "stream": stream,
+    }
+    if sampling:
+        body.update(_sampling(s))
+    return json.dumps(body, ensure_ascii=False).encode("utf-8")
 
 
 def _retry_after(e: urllib.error.HTTPError, attempt: int) -> float:
@@ -131,8 +171,10 @@ def _open(
     max_tokens: int | None = None,
     on_retry: Callable[[int, float], None] | None = None,
     should_stop: Callable[[], bool] | None = None,
+    temperature: float | None = None,
 ):
-    data = _payload(s, messages, stream, max_tokens)
+    global _sampling_ok
+    data = _payload(s, messages, stream, max_tokens, temperature=temperature)
 
     for attempt in range(MAX_RETRIES + 1):
         req = urllib.request.Request(
@@ -156,6 +198,22 @@ def _open(
                 detail = body.get("error", {}).get("message") or body.get("message") or ""
             except Exception:
                 pass
+
+            # 网关不认惩罚项：整个会话内摘掉它们重发一次，不再白试。
+            # 只有当报错确实指向这些参数（或网关没给理由）时才降级，
+            # 避免把「上下文超长」之类的真错误误判成参数问题。
+            low = detail.lower()
+            if (
+                e.code == 400
+                and _sampling_ok
+                and _sampling(s)
+                and (not detail or any(k in low for k in _SAMPLING_DEFAULTS))
+            ):
+                _sampling_ok = False
+                data = _payload(s, messages, stream, max_tokens, sampling=False,
+                                temperature=temperature)
+                continue
+
             raise AIError(f"HTTP {e.code} {e.reason}" + (f" — {detail}" if detail else "")) from e
         except urllib.error.URLError as e:
             raise AIError(f"无法连接 {s.base_url} — {e.reason}") from e
@@ -224,6 +282,8 @@ MAX_CONTINUATIONS = 4
 MAX_TARGET_ROUNDS = 60
 # 接续时，模型常会复述上一轮结尾。低于该长度的重叠视为巧合，不去重。
 _MIN_OVERLAP = 8
+# 整块复述的最长搜索窗口（段落数），见 collapse_blocks
+MAX_DUP_BLOCK = 200
 
 # 自动接续时发给模型的指令。措辞直接决定它是否会把上一段和下一段挤在一起。
 CONTINUE_MSG = (
@@ -247,6 +307,9 @@ def collapse_repeats(text: str, min_len: int = 6, max_len: int = 60) -> str:
 
     模型偶发退化，会连续输出两遍完全相同的短语
     （如「苏晚棠眸中闪过苏晚棠眸中闪过」）。落盘前清理一遍。
+
+    逐初一比对中先做一次 O(1) 的首字符过滤 —— 两段要相等，首字符必然相等，
+    直接切片比较在十万字正文上会退化到秒级。
     """
     if not text:
         return text
@@ -254,8 +317,11 @@ def collapse_repeats(text: str, min_len: int = 6, max_len: int = 60) -> str:
     i, n = 0, len(text)
     while i < n:
         hit = False
-        for L in range(max_len, min_len - 1, -1):
-            if i + 2 * L <= n and text[i:i + L] == text[i + L:i + 2 * L]:
+        upper = min(max_len, (n - i) // 2)
+        for L in range(upper, min_len - 1, -1):
+            if text[i + L] != text[i]:
+                continue
+            if text[i:i + L] == text[i + L:i + 2 * L]:
                 out.append(text[i:i + L])
                 i += 2 * L
                 hit = True
@@ -298,12 +364,14 @@ def collapse_blocks(text: str, min_dup_len: int = 12, window: int = 6) -> str:
         paras = out
 
         # 2) 段落块整体重复
+        #    搜索窗口封顶 MAX_DUP_BLOCK：真实复述永远是局部的，不封顶会让
+        #    长篇（数千段）在这里退化成 O(n²) 的列表比较，整篇卡住几秒。
         n = len(paras)
         out = []
         i = 0
         while i < n:
             hit = False
-            for L in range((n - i) // 2, 0, -1):
+            for L in range(min(MAX_DUP_BLOCK, (n - i) // 2), 0, -1):
                 if paras[i:i + L] == paras[i + L:i + 2 * L]:
                     out.extend(paras[i:i + L])
                     i += 2 * L
@@ -470,15 +538,32 @@ def stream_completion(
         ]
 
 
+# ── 非创作类任务的温度 ──────────────────────────────────
+# 续写要野，摘要、重排、分析要稳。这些活儿共用 s.temperature（默认 0.92）
+# 时，模型会把「压缩前情」写成续写、把「只重排不改字」改成重写 ——
+# 温度跟着任务走，不跟着续写设置走。
+TEMP_TASK = 0.3      # 压缩记忆 / 章节摘要：求准
+TEMP_STRICT = 0.1    # 重排段落：一个字都不许改
+TEMP_ANALYSIS = 0.4  # 通读分析：要稳，但允许一点归纳
+TEMP_IDEA = 0.8      # 补全设定 / 拟书名：要发散
+
+
 def complete(
     s: Settings,
     messages: list[dict],
     max_tokens: int = 700,
     on_retry: Callable[[int, float], None] | None = None,
+    temperature: float | None = None,
 ) -> str:
-    """一次性调用（用于记忆摘要）。"""
+    """一次性调用（用于记忆摘要）。
+
+    temperature 为 None 时用 TEMP_TASK —— 这类任务求准，不该跟着续写的
+    0.92 一起飘；确实想要发散的调用方（拟书名等）自己传高温。
+    """
+    temp = TEMP_TASK if temperature is None else temperature
     for attempt in range(MAX_RETRIES + 1):
-        resp = _open(s, messages, stream=False, max_tokens=max_tokens, on_retry=on_retry)
+        resp = _open(s, messages, stream=False, max_tokens=max_tokens,
+                     on_retry=on_retry, temperature=temp)
         try:
             with resp:
                 raw = resp.read()
@@ -529,7 +614,7 @@ def expand_settings(p: Project, on_step: Callable[[str], None] | None = None) ->
         {"role": "system", "content": EXPAND_PROMPT},
         {"role": "user", "content": "\n\n".join(parts)},
     ]
-    return complete(s, messages, max_tokens=2000)
+    return complete(s, messages, max_tokens=2000, temperature=TEMP_IDEA)
 
 
 def analyze_corpus(p: Project, on_step: Callable[[str], None] | None = None) -> str:
@@ -566,7 +651,7 @@ def analyze_corpus(p: Project, on_step: Callable[[str], None] | None = None) -> 
         {"role": "system", "content": ANALYSIS_PROMPT},
         {"role": "user", "content": "\n\n".join(parts)},
     ]
-    return complete(s, messages, max_tokens=1400)
+    return complete(s, messages, max_tokens=1400, temperature=TEMP_ANALYSIS)
 
 
 def corpus_digest(corpus: list[Corpus], budget: int) -> str:
@@ -693,7 +778,8 @@ def build_messages(
 
     blocks.append(
         f"现在请续写《{p.title}》的「{ch.title}」。"
-        "直接输出接下来的 2 到 4 个自然段正文，不要重复上文任何一句话。"
+        f"直接输出接下来的 {PARAS_MIN} 到 {PARAS_MAX} 个自然段正文，"
+        "从紧邻上文的断点接着往下走，不要复述上文已经交代过的内容。"
     )
 
     return [
@@ -774,7 +860,7 @@ def reformat_chapter(p: Project, on_step=None) -> str:
             {"role": "system", "content": REFORMAT_PROMPT},
             {"role": "user", "content": chunk},
         ]
-        result = complete(s, messages, max_tokens=s.max_tokens)
+        result = complete(s, messages, max_tokens=s.max_tokens, temperature=TEMP_STRICT)
         out_parts.append(result.strip())
 
     merged = "\n\n".join(out_parts)
@@ -809,8 +895,10 @@ def suggest_titles(p: Project, on_step: Callable[[str], None] | None = None) -> 
     parts: list[str] = []
     if p.premise.strip():
         parts.append("【故事方向】\n" + p.premise.strip())
-    if p.analysis.strip():
-        parts.append("【作品简报】\n" + p.analysis.strip())
+    # 注意不是 p.analysis —— 旧版的「作品简报」已在载入时一次性并入设定，
+    # 那个字段此后恒为空。这里要补的是「前情记忆」里实际发生过的事。
+    if p.memory.strip():
+        parts.append("【前情记忆】\n" + p.memory.strip())
     digest = corpus_digest(p.corpus, s.corpus_budget)
     if digest:
         parts.append("【参考语料】\n" + digest)
@@ -824,7 +912,77 @@ def suggest_titles(p: Project, on_step: Callable[[str], None] | None = None) -> 
         {"role": "system", "content": TITLE_PROMPT},
         {"role": "user", "content": "\n\n".join(parts)},
     ]
-    return complete(s, messages, max_tokens=400)
+    return complete(s, messages, max_tokens=400, temperature=TEMP_IDEA)
+
+
+# ── 选中改写：四种模式 ──────────────────────────────────
+# 值 = (菜单标签, 交给模型的具体指令)
+REWRITE_MODES: dict[str, tuple[str, str]] = {
+    "polish": (
+        "润色",
+        "在不改动情节、信息与篇幅的前提下打磨文字：让动词更准确、去掉重复的"
+        "形容词与副词、修掉拗口的句子。意思必须与原段完全一致。",
+    ),
+    "expand": (
+        "扩写",
+        "把这段写得更充分：补足必要的动作、感官与心理细节，让场面真正落地。"
+        "情节走向不得改变，篇幅约为原文的 1.5 到 2 倍。",
+    ),
+    "condense": (
+        "缩写",
+        "删掉冗余，压缩到原文一半左右的篇幅。所有关键信息、转折与人物反应"
+        "都必须保留，只是写得更紧。",
+    ),
+    "rewrite": (
+        "重写",
+        "换一种写法重讲同一件事：可以调整句式、节奏与切入角度，但人物做了什么、"
+        "说了什么、结果如何，必须与原段一致。",
+    ),
+}
+
+REWRITE_PROMPT = """你是一位职业小说家，正在修改自己稿子里的一段文字。
+
+硬性要求：
+1. 直接输出改写后的正文，不要任何解释、标题、序号或 Markdown 标记。
+2. 情节、信息、人物行为与说话内容必须与原文一致；只改动表达，不改动事实。
+3. 严格遵守【作品设定】里的人名、称谓、关系与专有名词，不得改写错。
+4. 人称、时态、语气必须与【上文结尾】和【下文开头】自然衔接 ——
+   改写后的第一句要接得住上一段，最后一句要接得上下一段。
+5. 段落必须短：每个自然段只写 1 到 3 句，通常不超过 80 字。
+   对话必须独立成段，不得与叙述混在同一段里。
+6. 使用中文全角标点，对话使用中文引号。"""
+
+
+def build_rewrite_messages(
+    p: Project,
+    selection: str,
+    mode: str,
+    before: str = "",
+    after: str = "",
+) -> list[dict]:
+    """装配一次「局部改写」的上下文。
+
+    为什么前后都要给：只给选中段，模型不知道开头该用什么语气接上一段、
+    也不知道结尾该停在哪儿才不和下一段撞车。前后各取一小段作为接缝上下文。
+    """
+    label, instruction = REWRITE_MODES.get(mode, REWRITE_MODES["polish"])
+    blocks: list[str] = []
+
+    if p.premise.strip():
+        blocks.append("【作品设定】（最高优先级，须严格遵守）\n" + p.premise.strip()[:1200])
+
+    if before.strip():
+        blocks.append("【上文结尾】（仅供衔接，不要复述）\n……" + before.strip()[-600:])
+    if after.strip():
+        blocks.append("【下文开头】（务必自然衔接到这里）\n" + after.strip()[:600] + "……")
+
+    blocks.append("【待改写的原文】\n" + selection.strip())
+    blocks.append(f"【本次指令】{label}：{instruction}\n直接给出改写后的正文。")
+
+    return [
+        {"role": "system", "content": REWRITE_PROMPT},
+        {"role": "user", "content": "\n\n".join(blocks)},
+    ]
 
 
 def context_usage(p: Project) -> float:

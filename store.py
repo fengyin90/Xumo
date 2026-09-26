@@ -24,9 +24,99 @@ else:
 PROJECTS_DIR = os.path.join(APP_DIR, "projects")
 LAST_FILE = os.path.join(PROJECTS_DIR, ".last")
 
+# 每次保存前留一个回滚点，最多保留这么多份
+BACKUP_KEEP = 40
+
 
 def _uid() -> str:
     return uuid.uuid4().hex[:8]
+
+
+# 反序列化白名单，见 Project.from_dict
+_CHAPTER_FIELDS = frozenset({"id", "title", "body"})
+_CORPUS_FIELDS = frozenset({"id", "name", "text"})
+
+
+def backup_dir() -> str:
+    return os.path.join(PROJECTS_DIR, "backup")
+
+
+def snapshot(pid: str) -> str:
+    """把磁盘上的当前版本复制进 backup/，返回快照文件名。
+
+    唯一的存档入口：定期轮转与手动备份走同一段代码，避免两处规则漂移。
+    """
+    src = os.path.join(PROJECTS_DIR, f"{pid}.json")
+    folder = backup_dir()
+    os.makedirs(folder, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    dst = os.path.join(folder, f"{pid}-{stamp}.json")
+    # 同一秒内多次保存：追加序号，不覆盖
+    n = 1
+    while os.path.exists(dst):
+        dst = os.path.join(folder, f"{pid}-{stamp}-{n}.json")
+        n += 1
+    with open(src, encoding="utf-8") as f:
+        data = f.read()
+    with open(dst, "w", encoding="utf-8") as f:
+        f.write(data)
+    prune_backups(pid)
+    return os.path.basename(dst)
+
+
+def prune_backups(pid: str, keep: int = BACKUP_KEEP) -> None:
+    """按名倒序保留最近 keep 份快照。"""
+    folder = backup_dir()
+    if not os.path.isdir(folder):
+        return
+    olds = sorted(
+        (f for f in os.listdir(folder) if f.startswith(pid + "-")),
+        reverse=True,
+    )
+    for old in olds[keep:]:
+        try:
+            os.remove(os.path.join(folder, old))
+        except OSError:
+            pass
+
+
+def list_backups(pid: str) -> list[tuple[str, float, int]]:
+    """返回 [(文件名, 修改时间, 字节数)]，新的在前。
+
+    只读文件名与 stat —— 不解析内容。列举 40 份大项目 JSON 会很慢，
+    正文详情留到预览时按需读取。
+    """
+    folder = backup_dir()
+    if not os.path.isdir(folder):
+        return []
+    out: list[tuple[str, float, int]] = []
+    for name in os.listdir(folder):
+        if not name.startswith(pid + "-") or not name.endswith(".json"):
+            continue
+        fp = os.path.join(folder, name)
+        try:
+            st = os.stat(fp)
+        except OSError:
+            continue
+        out.append((name, st.st_mtime, st.st_size))
+    out.sort(key=lambda x: x[1], reverse=True)
+    return out
+
+
+def read_backup(pid: str, name: str) -> dict:
+    with open(os.path.join(backup_dir(), name), encoding="utf-8") as f:
+        return json.load(f)
+
+
+def restore_backup(pid: str, name: str) -> "Project":
+    """把某个快照恢复成项目的当前版本。
+
+    恢复前会自动再存一份当前状态 —— 回滚本身也必须是可撤销的。
+    """
+    p = Project.from_dict(read_backup(pid, name))
+    p.id = pid
+    p.save()
+    return p
 
 
 # ── 数据模型 ────────────────────────────────────────────
@@ -60,6 +150,14 @@ class Settings:
     model: str = "deepseek-chat"
     temperature: float = 0.92
     max_tokens: int = 1600
+    # ── 采样惩罚项 ──
+    # presence_penalty：压低「已经出现过的词」再次中选的概率，逼模型换说法。
+    # frequency_penalty：按出现次数累加惩罚，专治车轱辘话。
+    # 两者都是 0 时不写进请求体（见 ai._sampling）。
+    presence_penalty: float = 0.3
+    frequency_penalty: float = 0.3
+    # top_p：核采样阈值。1.0 = 不限制，等于不发送。
+    top_p: float = 1.0
     # 单次注入的前文上限（字）。超出部分会被压缩进记忆摘要。
     context_budget: int = 5000
     # 语料注入上限
@@ -130,8 +228,16 @@ class Project:
             )
             p.premise = merged
             p.analysis = ""
-        p.chapters = [Chapter(**c) for c in d.get("chapters", [])]
-        p.corpus = [Corpus(**c) for c in d.get("corpus", [])]
+        # 未知字段一律忽略：由更高版本写出的备份，在低版本上也要能读开，
+        # 否则历史版本回溯会被一个新增字段彻底卡死。
+        p.chapters = [
+            Chapter(**{k: v for k, v in c.items() if k in _CHAPTER_FIELDS})
+            for c in d.get("chapters", [])
+        ]
+        p.corpus = [
+            Corpus(**{k: v for k, v in c.items() if k in _CORPUS_FIELDS})
+            for c in d.get("corpus", [])
+        ]
         s = d.get("settings") or {}
         known = {f for f in Settings.__dataclass_fields__}
         p.settings = Settings(**{k: v for k, v in s.items() if k in known})
@@ -140,41 +246,15 @@ class Project:
         p.current = max(0, min(p.current, len(p.chapters) - 1))
         return p
 
-    # 每次保存前，把旧文件滚动留档，最多保留这么多个版本
-    BACKUP_KEEP = 40
-
     def _rotate_backup(self) -> None:
         """把当前磁盘上的版本复制进 backup/，再写新版本。
 
-        每次保存都留一个回滚点：误删、误改、程序写坏都能退回去。
         用时间戳命名，按名倒序保留最近 BACKUP_KEEP 份。
         """
-        src = self.path()
-        if not os.path.exists(src):
+        if not os.path.exists(self.path()):
             return
-        folder = os.path.join(PROJECTS_DIR, "backup")
         try:
-            os.makedirs(folder, exist_ok=True)
-            stamp = time.strftime("%Y%m%d-%H%M%S")
-            dst = os.path.join(folder, f"{self.id}-{stamp}.json")
-            # 同一秒内多次保存：追加序号，不覆盖
-            n = 1
-            while os.path.exists(dst):
-                dst = os.path.join(folder, f"{self.id}-{stamp}-{n}.json")
-                n += 1
-            with open(src, encoding="utf-8") as f:
-                data = f.read()
-            with open(dst, "w", encoding="utf-8") as f:
-                f.write(data)
-            olds = sorted(
-                (f for f in os.listdir(folder) if f.startswith(self.id)),
-                reverse=True,
-            )
-            for old in olds[self.BACKUP_KEEP:]:
-                try:
-                    os.remove(os.path.join(folder, old))
-                except OSError:
-                    pass
+            snapshot(self.id)
         except OSError:
             pass  # 备份失败不该阻断保存
 
@@ -242,7 +322,7 @@ def delete_project(pid: str) -> None:
     if os.path.exists(fp):
         os.remove(fp)
     # 备份
-    folder = os.path.join(PROJECTS_DIR, "backup")
+    folder = backup_dir()
     if os.path.isdir(folder):
         for name in os.listdir(folder):
             if name.startswith(pid):

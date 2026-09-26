@@ -13,20 +13,23 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
+from collections.abc import Callable
 
 from PyQt6.QtCore import (
     QEasingCurve, QEvent, QObject, QPoint, QPropertyAnimation, Qt, QTimer, pyqtSignal,
 )
 from PyQt6.QtGui import (
-    QAction, QColor, QCursor, QFont, QKeySequence, QTextBlockFormat, QTextCursor,
+    QAction, QCursor, QTextBlockFormat, QTextCursor,
 )
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QDialog, QDoubleSpinBox, QFileDialog,
-    QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget,
-    QListWidgetItem, QMenu, QPlainTextEdit, QPushButton, QSizeGrip, QSpinBox,
-    QStackedWidget, QTextEdit, QVBoxLayout, QWidget,
+    QAbstractItemView, QApplication, QButtonGroup, QDialog, QDoubleSpinBox, QFileDialog,
+    QFrame, QGraphicsOpacityEffect, QGridLayout, QHBoxLayout, QHeaderView, QInputDialog,
+    QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu, QMessageBox,
+    QPlainTextEdit, QProgressBar, QPushButton, QSizeGrip, QSpinBox,
+    QStackedWidget, QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget,
 )
 
 import ai as AI
@@ -47,6 +50,9 @@ class Manuscript(QTextEdit):
 
     MAX_RHYTHM_DOC = 120_000
 
+    # 改写请求：参数为模式键（见 ai.REWRITE_MODES）
+    rewrite_requested = pyqtSignal(str)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("Manuscript")
@@ -54,13 +60,47 @@ class Manuscript(QTextEdit):
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setPlaceholderText("在此落笔，或按下方的「续写」，让引擎接着往下写。")
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._menu)
         self._quiet = False
         self._guard = False
+        # 改写现场：起点、当前写入位置、被替下的原文
+        self._rw_start = 0
+        self._rw_pos = 0
+        self._rw_orig = ""
         self._rhythm = QTimer(self)
         self._rhythm.setSingleShot(True)
         self._rhythm.setInterval(160)
         self._rhythm.timeout.connect(self._apply_rhythm)
         self.textChanged.connect(self._on_changed)
+
+    def _menu(self, pos: QPoint) -> None:
+        """右键菜单：常规编辑动作 + 选中时的 AI 改写。"""
+        m = QMenu(self)
+        cur = self.textCursor()
+        has_sel = cur.hasSelection()
+        for label, obj, enabled in (
+            ("撤销", "undo", self.document().isUndoAvailable()),
+            ("重做", "redo", self.document().isRedoAvailable()),
+        ):
+            a = QAction(label, self)
+            a.triggered.connect(getattr(self, obj))
+            a.setEnabled(enabled)
+            m.addAction(a)
+        m.addSeparator()
+        for label, obj in (("剪切", "cut"), ("复制", "copy"), ("粘贴", "paste")):
+            a = QAction(label, self)
+            a.triggered.connect(getattr(self, obj))
+            a.setEnabled(True if obj == "paste" else has_sel)
+            m.addAction(a)
+        m.addSeparator()
+        sub = m.addMenu("AI 改写")
+        sub.setEnabled(has_sel)
+        for mode, (label, _) in AI.REWRITE_MODES.items():
+            a = QAction(label, self)
+            a.triggered.connect(lambda _=False, k=mode: self.rewrite_requested.emit(k))
+            sub.addAction(a)
+        m.exec(self.mapToGlobal(pos))
 
     # ── 节奏 ──
     @staticmethod
@@ -132,6 +172,50 @@ class Manuscript(QTextEdit):
 
     def body(self) -> str:
         return self.toPlainText()
+
+    # ── 就地改写 ──
+    def begin_rewrite(self) -> str:
+        """腾出位置：删掉选中段，记下插入点与原文，返回原文。
+
+        原文要先取走再删 —— 选中的可能是好几段，界面上一旦删除，
+        这份文本就只剩下我们手里这个副本。失败时要靠它退回去。
+        """
+        cur = self.textCursor()
+        start, end = cur.selectionStart(), cur.selectionEnd()
+        orig = self.toPlainText()[start:end]
+        self._rw_start = self._rw_pos = start
+        self._rw_orig = orig
+        self._quiet = True
+        cur.setPosition(start)
+        cur.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
+        cur.setBlockFormat(self._block_format())
+        cur.removeSelectedText()
+        return orig
+
+    def put_rewrite(self, text: str) -> None:
+        """把改写增量接到正在生长的那一段末尾。"""
+        cur = self.textCursor()
+        cur.setPosition(self._rw_pos)
+        cur.insertText(text)
+        self._rw_pos += len(text)
+        self.setTextCursor(cur)
+        self.ensureCursorVisible()
+
+    def end_rewrite(self) -> None:
+        self._quiet = False
+        self._apply_rhythm()
+
+    def restore_rewrite(self) -> None:
+        """一字未出就失败了：把原文放回原位，等于什么都没发生。"""
+        if not self._rw_orig:
+            return
+        cur = self.textCursor()
+        cur.setPosition(self._rw_start)
+        cur.setPosition(self._rw_pos, QTextCursor.MoveMode.KeepAnchor)
+        cur.insertText(self._rw_orig)
+        self._rw_orig = ""
+        self._quiet = False
+        self._apply_rhythm()
 
 
 # ══════════════════════════════════════════════════════════
@@ -426,7 +510,11 @@ class Rail(QWidget):
             self.list.addItem(it)
         self.list.setCurrentRow(current)
         self.list.blockSignals(False)
-        self.count.setText(f"{len(chapters)} 章")
+        self.set_totals(len(chapters), sum(c.words() for c in chapters))
+
+    def set_totals(self, chapters: int, words: int) -> None:
+        """左栏页脚：章节数与全书字数。写长篇时真正想盯的是总量。"""
+        self.count.setText(f"{chapters} 章 · {words:,} 字")
 
     def _menu(self, pos: QPoint) -> None:
         it = self.list.itemAt(pos)
@@ -454,7 +542,6 @@ class Rail(QWidget):
         m.exec(self.list.mapToGlobal(pos))
 
     def _rename(self, row: int) -> None:
-        from PyQt6.QtWidgets import QInputDialog
         cur = self.list.item(row).text().split("   ", 1)[-1]
         name, ok = QInputDialog.getText(self, "重命名章节", "标题：", text=cur)
         if ok and name.strip():
@@ -473,6 +560,8 @@ class Desk(QWidget):
     opening = pyqtSignal()
     stop = pyqtSignal()
     retitled = pyqtSignal(str)
+    stats = pyqtSignal()
+    rewrite = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
@@ -578,6 +667,21 @@ class Desk(QWidget):
         m.addAction(a_link)
         m.addSeparator()
         m.addAction(a_reformat)
+        m.addSeparator()
+        a_stats = QAction("写作统计", self)
+        a_stats.triggered.connect(self.stats.emit)
+        m.addAction(a_stats)
+
+        # AI 改写只在选中文字时可用 —— 没有选区就置灰，比点了再报错清楚
+        has_sel = self.paper.textCursor().hasSelection()
+        sub = m.addMenu("AI 改写")
+        sub.setEnabled(has_sel)
+        for mode, (label, _) in AI.REWRITE_MODES.items():
+            a = QAction(label, self)
+            a.setEnabled(has_sel)
+            a.triggered.connect(lambda _=False, k=mode: self.rewrite.emit(k))
+            sub.addAction(a)
+
         btn = self.more_btn
         m.exec(btn.mapToGlobal(btn.rect().bottomLeft()))
 
@@ -1153,6 +1257,7 @@ class ResultDialog(QDialog):
     """
 
     append_to_brief = pyqtSignal(str)
+    closed = pyqtSignal()
 
     def __init__(self, parent, instruction: str):
         super().__init__(parent)
@@ -1215,6 +1320,11 @@ class ResultDialog(QDialog):
     def fail(self, msg: str) -> None:
         self.note.setText("失败：" + msg)
 
+    def closeEvent(self, e) -> None:
+        # 通知主窗口清空引用 —— 留着指向已隐藏窗口的句柄没有意义
+        self.closed.emit()
+        super().closeEvent(e)
+
     def _copy(self) -> None:
         QApplication.clipboard().setText(self.body.toPlainText())
 
@@ -1237,6 +1347,218 @@ class ResultDialog(QDialog):
             self.note.setText(f"已导出 → {os.path.basename(path)}")
         except OSError as e:
             self.note.setText(f"导出失败：{e}")
+
+
+# ══════════════════════════════════════════════════════════
+#  写作统计
+# ══════════════════════════════════════════════════════════
+
+class StatsDialog(QDialog):
+    """全书体量与各章分布。
+
+    字数口径与左栏目录一致 —— 中文按字计，去空白与换行。
+    """
+
+    closed = pyqtSignal()
+
+    def __init__(self, parent, project: Project):
+        super().__init__(parent)
+        self.setWindowTitle(f"写作统计 · {project.title}")
+        self.setModal(False)
+        self.resize(500, 620)
+
+        counts = [ch.words() for ch in project.chapters]
+        total = sum(counts)
+        corpus_chars = sum(c.chars for c in project.corpus)
+
+        col = QVBoxLayout(self)
+        col.setContentsMargins(T.GAP_LG, T.GAP_LG, T.GAP_LG, T.GAP)
+        col.setSpacing(T.GAP_SM)
+
+        col.addWidget(section_title("总览"))
+        facts = QGridLayout()
+        facts.setContentsMargins(0, 0, 0, 0)
+        facts.setHorizontalSpacing(T.GAP_LG)
+        facts.setVerticalSpacing(T.GAP_XS)
+        rows = [
+            ("全书字数", f"{total:,}"),
+            ("章节数", str(len(counts))),
+            ("平均每章", f"{total // len(counts):,}" if counts else "—"),
+            ("最长章节", f"{max(counts):,}" if counts else "—"),
+            ("设定字数", f"{len(project.premise.strip()):,}"),
+            ("前情记忆", f"{len(project.memory.strip()):,}"),
+            ("参考语料", f"{len(project.corpus)} 份 · {corpus_chars:,} 字"),
+        ]
+        for i, (k, v) in enumerate(rows):
+            facts.addWidget(field_label(k), i, 0, Qt.AlignmentFlag.AlignVCenter)
+            lb = QLabel(v)
+            lb.setObjectName("StatValue")
+            facts.addWidget(lb, i, 1, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        facts.setColumnStretch(0, 1)
+        col.addLayout(facts)
+
+        col.addSpacing(T.GAP_SM)
+        col.addWidget(section_title("各章字数"))
+
+        table = QTableWidget(len(counts), 3)
+        table.setHorizontalHeaderLabels(["章节", "字数", "占比"])
+        table.verticalHeader().setVisible(False)
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        table.setShowGrid(False)
+        table.setAlternatingRowColors(False)
+        hh = table.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        table.setColumnWidth(1, 78)
+        table.setColumnWidth(2, 120)
+
+        for i, (ch, w) in enumerate(zip(project.chapters, counts)):
+            table.setItem(i, 0, QTableWidgetItem(f"{i + 1:02d}   {ch.title}"))
+            cnt = QTableWidgetItem(f"{w:,}")
+            cnt.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            table.setItem(i, 1, cnt)
+            share = (w / total * 100) if total else 0.0
+            bar = QProgressBar()
+            bar.setRange(0, 100)
+            bar.setValue(int(share))
+            bar.setFormat(f"{share:.1f}%")
+            table.setCellWidget(i, 2, bar)
+        col.addWidget(table, 1)
+
+        bar_row = QHBoxLayout()
+        bar_row.addStretch(1)
+        close = ghost_button("关闭")
+        close.clicked.connect(self.close)
+        bar_row.addWidget(close)
+        col.addLayout(bar_row)
+
+    def closeEvent(self, e) -> None:
+        self.closed.emit()
+        super().closeEvent(e)
+
+
+# ══════════════════════════════════════════════════════════
+#  历史版本
+# ══════════════════════════════════════════════════════════
+
+class VersionsDialog(QDialog):
+    """把 projects/backup 里的快照，变成可查看、可回退的版本列表。
+
+    列举时只读文件名与 stat，不解析 JSON —— 40 份大项目一起解析会卡住界面，
+    正文详情等到选中某一行时才按需读入。
+    """
+
+    restored = pyqtSignal(str)
+    closed = pyqtSignal()
+
+    def __init__(self, parent, project: Project):
+        super().__init__(parent)
+        self.setWindowTitle(f"历史版本 · {project.title}")
+        self.setModal(False)
+        self.resize(560, 520)
+
+        self._pid = project.id
+        self._files: list[str] = []
+
+        col = QVBoxLayout(self)
+        col.setContentsMargins(T.GAP_LG, T.GAP_LG, T.GAP_LG, T.GAP)
+        col.setSpacing(T.GAP_SM)
+
+        head = QHBoxLayout()
+        head.addWidget(section_title("历史版本"))
+        head.addStretch(1)
+        self.count = hint("")
+        head.addWidget(self.count)
+        col.addLayout(head)
+
+        self.list = QListWidget()
+        self.list.setObjectName("Plain")
+        self.list.currentRowChanged.connect(self._detail)
+        col.addWidget(self.list, 1)
+
+        col.addWidget(section_title("详情"))
+        self.info = QLabel("尚未选择版本")
+        self.info.setObjectName("Hint")
+        self.info.setWordWrap(True)
+        self.info.setMinimumHeight(76)
+        self.info.setAlignment(Qt.AlignmentFlag.AlignTop)
+        col.addWidget(self.info)
+
+        bar = QHBoxLayout()
+        self.note = hint("")
+        bar.addWidget(self.note)
+        bar.addStretch(1)
+        self.restore_btn = ghost_button("恢复此版本")
+        self.restore_btn.setEnabled(False)
+        self.restore_btn.setToolTip("回滚到选中的版本。当前状态会先存一份快照，可再次回退。")
+        self.restore_btn.clicked.connect(self._restore)
+        bar.addWidget(self.restore_btn)
+        close = ghost_button("关闭")
+        close.clicked.connect(self.close)
+        bar.addWidget(close)
+        col.addLayout(bar)
+
+        self._reload()
+
+    def _reload(self) -> None:
+        rows = store.list_backups(self._pid)
+        self._files = [name for name, _, _ in rows]
+        self.list.clear()
+        for name, mtime, size in rows:
+            stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(mtime))
+            self.list.addItem(f"{stamp}    ·    {size / 1024:.0f} KB")
+        self.count.setText(f"{len(rows)} 份")
+        self.info.setText("尚未选择版本" if rows else "还没有历史版本 —— 每次保存都会自动留档。")
+        self.restore_btn.setEnabled(False)
+
+    def _detail(self, row: int) -> None:
+        if not (0 <= row < len(self._files)):
+            self.info.setText("尚未选择版本")
+            self.restore_btn.setEnabled(False)
+            return
+        self.restore_btn.setEnabled(True)
+        try:
+            p = store.Project.from_dict(store.read_backup(self._pid, self._files[row]))
+        except (OSError, ValueError, TypeError) as e:
+            self.info.setText(f"这个版本读不出来，可能已损坏：{e}")
+            self.restore_btn.setEnabled(False)
+            return
+        words = sum(ch.words() for ch in p.chapters)
+        self.info.setText(
+            f"《{p.title}》  ·  {len(p.chapters)} 章  ·  {words:,} 字\n"
+            f"设定 {len(p.premise.strip()):,} 字  ·  "
+            f"记忆 {len(p.memory.strip()):,} 字  ·  "
+            f"语料 {len(p.corpus)} 份"
+        )
+
+    def _restore(self) -> None:
+        row = self.list.currentRow()
+        if not (0 <= row < len(self._files)):
+            return
+        name = self._files[row]
+        stamp = self.list.item(row).text().split("    ·    ")[0]
+        r = QMessageBox.warning(
+            self, "恢复历史版本",
+            f"将把当前作品回滚到 {stamp} 这一版。\n\n"
+            "当前状态会先存一份快照，之后仍可从本面板再次回退。确定吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if r != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            store.restore_backup(self._pid, name)
+        except (OSError, ValueError) as e:
+            self.note.setText(f"恢复失败：{e}")
+            return
+        self.note.setText("已恢复，正在重新载入…")
+        self.restored.emit(name)
+
+    def closeEvent(self, e) -> None:
+        self.closed.emit()
+        super().closeEvent(e)
 
 
 # ══════════════════════════════════════════════════════════
@@ -1285,6 +1607,27 @@ class SettingsDialog(QDialog):
         self.temp.setValue(s.temperature)
         add("温度", self.temp)
 
+        self.topp = QDoubleSpinBox()
+        self.topp.setRange(0.05, 1.0)
+        self.topp.setSingleStep(0.05)
+        self.topp.setDecimals(2)
+        self.topp.setValue(s.top_p)
+        add("核采样", self.topp)
+
+        self.pres = QDoubleSpinBox()
+        self.pres.setRange(-2.0, 2.0)
+        self.pres.setSingleStep(0.05)
+        self.pres.setDecimals(2)
+        self.pres.setValue(s.presence_penalty)
+        add("存在惩罚", self.pres)
+
+        self.freq = QDoubleSpinBox()
+        self.freq.setRange(-2.0, 2.0)
+        self.freq.setSingleStep(0.05)
+        self.freq.setDecimals(2)
+        self.freq.setValue(s.frequency_penalty)
+        add("频率惩罚", self.freq)
+
         self.mtok = QSpinBox()
         self.mtok.setRange(128, 8192)
         self.mtok.setSingleStep(128)
@@ -1323,7 +1666,13 @@ class SettingsDialog(QDialog):
         self.font.setValue(getattr(s, "editor_size", 16) or 16)
         add("正文字号", self.font)
 
-        note = hint("预算以「字」计。正文超出上下文预算后，旧情节会自动压缩进前情记忆。单章上限控制「一键生成」时自动开新章的字数。")
+        note = hint(
+            "预算以「字」计。正文超出上下文预算后，旧情节会自动压缩进前情记忆。"
+            "单章上限控制「一键生成」时自动开新章的字数。\n"
+            "存在惩罚压低「已经出现过的词」再次中选的概率，逼模型换说法、换话题；"
+            "频率惩罚按出现次数累加，专治车轱辘话。两者 0.3 起步，"
+            "写得散、跑题就往下调。核采样 1.0 为不限制。"
+        )
         note.setWordWrap(True)
         g.addWidget(note, r, 0, 1, 2)
         r += 1
@@ -1348,7 +1697,7 @@ class SettingsDialog(QDialog):
             if k not in {
                 "base_url", "api_key", "model", "temperature", "max_tokens",
                 "context_budget", "corpus_budget", "target_chars", "chapter_max",
-                "editor_size",
+                "editor_size", "top_p", "presence_penalty", "frequency_penalty",
             }
         }
         return Settings(
@@ -1357,6 +1706,9 @@ class SettingsDialog(QDialog):
             api_key=self.key.text().strip(),
             model=self.model.text().strip() or "deepseek-chat",
             temperature=float(self.temp.value()),
+            top_p=float(self.topp.value()),
+            presence_penalty=float(self.pres.value()),
+            frequency_penalty=float(self.freq.value()),
             max_tokens=int(self.mtok.value()),
             context_budget=int(self.ctx.value()),
             corpus_budget=int(self.cor.value()),
@@ -1386,13 +1738,13 @@ class Window(QWidget):
 
         self.project: Project = store.load_last()
 
+        # 后台线程（整理记忆、流式续写）与主线程 autosave 都会动同一个 Project，
+        # 写盘必须串行 —— 否则 autosave 可能把写了一半的记忆落盘。
+        self._plock = threading.RLock()
+
         # 配色先于任何控件创建，避免首帧闪色
         T.set_palette(self.project.settings.theme)
-        app = QApplication.instance()
-        if app is not None:
-            app.setStyleSheet(
-                T.build_qss(editor_size=self.project.settings.editor_size)
-            )
+        self._apply_qss()
 
         self.bridge = Bridge()
         self.bridge.delta.connect(self._on_delta)
@@ -1410,6 +1762,10 @@ class Window(QWidget):
         self._stream_target = "paper"
         self._result: ResultDialog | None = None
         self._reader: ReaderWindow | None = None
+        self._versions: VersionsDialog | None = None
+        self._stats: StatsDialog | None = None
+        self._rewrite_wrote = False
+        self._rewrite_label = ""
 
         # 一键生成状态
         self._gen_active = False
@@ -1456,6 +1812,9 @@ class Window(QWidget):
         self.desk.reformat.connect(self._start_reformat)
         self.desk.generate.connect(self._start_generate)
         self.desk.opening.connect(self._start_opening)
+        self.desk.stats.connect(self._open_stats)
+        self.desk.rewrite.connect(self._start_rewrite)
+        self.desk.paper.rewrite_requested.connect(self._start_rewrite)
         self.inspector.names.connect(self._start_names)
         self.desk.stop.connect(self._request_stop)
         self.desk.retitled.connect(self._retitle)
@@ -1479,6 +1838,12 @@ class Window(QWidget):
         self.autosave.setInterval(8000)
         self.autosave.timeout.connect(self._autosave)
         self.autosave.start()
+
+        # 全书字数要遍历所有章节，每次按键都算一遍太贵 —— 收敛成末次触发
+        self._meta_timer = QTimer(self)
+        self._meta_timer.setSingleShot(True)
+        self._meta_timer.setInterval(600)
+        self._meta_timer.timeout.connect(self._refresh_totals)
 
         self._load_all(first=True)
 
@@ -1505,6 +1870,31 @@ class Window(QWidget):
         if self._dirty:
             self._save()
 
+    # ══════════════ 公共设施 ══════════════
+
+    def _apply_qss(self) -> None:
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(
+                T.build_qss(editor_size=self.project.settings.editor_size)
+            )
+
+    def _worker(self, fn: Callable[[], None]) -> None:
+        """统一的后台线程入口。
+
+        曾经每个 AI 动作都要重抄一遍「起线程 → try/except → AIError 与其它异常
+        分别转成失败信号」这六行样板。抽走之后，每个动作只剩下它自己的业务。
+        """
+        def wrapped() -> None:
+            try:
+                fn()
+            except AI.AIError as e:
+                self.bridge.failed.emit(str(e))
+            except Exception as e:  # noqa: BLE001
+                self.bridge.failed.emit(f"{type(e).__name__}: {e}")
+
+        threading.Thread(target=wrapped, daemon=True).start()
+
     def _save(self) -> None:
         p = self.project
         p.chapter.title = self.desk.title.text().strip() or "未命名"
@@ -1512,7 +1902,8 @@ class Window(QWidget):
         p.memory = self.inspector.memory.toPlainText()
         p.premise = self.inspector.premise.toPlainText()
         try:
-            p.save()
+            with self._plock:
+                p.save()
             self._dirty = False
         except OSError as e:
             self.desk.set_status(f"保存失败：{e}")
@@ -1544,9 +1935,12 @@ class Window(QWidget):
         self._dirty = True
 
     def _crossfade(self) -> None:
-        """切换章节时的交叉淡入：内容换了，空间没有断裂。"""
-        self.desk.paper.setGraphicsEffect(None)
-        from PyQt6.QtWidgets import QGraphicsOpacityEffect
+        """切换章节时的交叉淡入：内容换了，空间没有断裂。
+
+        动画对象不能用 DeleteWhenStopped —— 它会在结束时删掉 C++ 对象，
+        而 finished 里的槽还握着它的引用，再碰一次就是野指针。这里让它
+        被主窗口收着（parent=self），自然活到下次重用。
+        """
         eff = QGraphicsOpacityEffect(self.desk.paper)
         self.desk.paper.setGraphicsEffect(eff)
         anim = QPropertyAnimation(eff, b"opacity", self)
@@ -1555,8 +1949,7 @@ class Window(QWidget):
         anim.setEndValue(1.0)
         anim.setEasingCurve(QEasingCurve.Type.OutCubic)
         anim.finished.connect(lambda: self.desk.paper.setGraphicsEffect(None))
-        anim.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
-        self._fade = anim
+        anim.start()
 
     def _add_chapter(self) -> None:
         self._stash()
@@ -1618,7 +2011,6 @@ class Window(QWidget):
         n = len(p.chapters)
         if keep_row == drop_row or not (0 <= keep_row < n and 0 <= drop_row < n):
             return
-        from PyQt6.QtWidgets import QMessageBox
         keep_title = p.chapters[keep_row].title
         drop_title = p.chapters[drop_row].title
         r = QMessageBox.question(
@@ -1660,20 +2052,27 @@ class Window(QWidget):
         self._dirty = True
         self._save()
 
-    def _rename_project(self, name: str) -> None:
-        self.project.title = name
-        self.titlebar.title_lbl.setText(name)
-        self.titlebar.set_crumb(f"第 {self.project.current + 1} / {len(self.project.chapters)} 章")
-        self._dirty = True
-
     def _retitle(self, name: str) -> None:
         self.project.chapter.title = name
         self.rail.load(self.project.chapters, self.project.current)
         self._dirty = True
 
+    def _refresh_totals(self) -> None:
+        """左栏页脚的全书字数。
+
+        先把编辑中的内容并回 project —— 否则统计的是上次存盘的版本，
+        正在敲的这一章会漏掉。
+        """
+        self._stash()
+        self.rail.set_totals(
+            len(self.project.chapters),
+            sum(c.words() for c in self.project.chapters),
+        )
+
     def _on_text(self) -> None:
         self._dirty = True
         self.desk.refresh_meta(self.project)
+        self._meta_timer.start()
 
     # ══════════════ 语料 ══════════════
 
@@ -1740,12 +2139,51 @@ class Window(QWidget):
         self._reader = ReaderWindow(self, self.project)
         self._reader.show()
 
+    def _open_stats(self) -> None:
+        """写作统计。先 stash —— 统计要算当前正在编辑的这一章。"""
+        self._stash()
+        if self._stats is not None:
+            self._stats.close()
+        self._stats = StatsDialog(self, self.project)
+        self._stats.closed.connect(self._forget_stats)
+        self._stats.show()
+
+    def open_versions(self) -> None:
+        """历史版本：误删、误改、AI 改坏了都能退回去。"""
+        self._save()
+        if self._versions is not None:
+            self._versions.close()
+        self._versions = VersionsDialog(self, self.project)
+        self._versions.closed.connect(self._forget_versions)
+        self._versions.restored.connect(self._on_version_restored)
+        self._versions.show()
+
+    def _forget_stats(self) -> None:
+        self._stats = None
+
+    def _forget_versions(self) -> None:
+        self._versions = None
+
+    def _forget_result(self) -> None:
+        self._result = None
+
+    def _on_version_restored(self, name: str) -> None:
+        """快照已写回磁盘，把界面整个重建成那一版的样子。"""
+        try:
+            self.project = store.open_project(self.project.id)
+        except (OSError, ValueError) as e:
+            self.desk.set_status(f"重新载入失败：{e}")
+            return
+        if self._versions is not None:
+            self._versions.close()
+        self._after_switch()
+        self.desk.set_status(f"已回滚到 {name.split('-', 1)[-1].replace('.json', '')} 这一版")
+
     # ══════════════ 设置 ══════════════
 
     # ══════════════ 作品 ══════════════
 
     def rename_project(self) -> None:
-        from PyQt6.QtWidgets import QInputDialog
         cur = self.project.title
         name, ok = QInputDialog.getText(self, "重命名作品", "作品名：", text=cur)
         if not ok:
@@ -1760,7 +2198,6 @@ class Window(QWidget):
         self.desk.set_status(f"已更名为《{name}》")
 
     def prompt_new_project(self) -> None:
-        from PyQt6.QtWidgets import QInputDialog
         if not self._confirm_discard():
             return
         name, ok = QInputDialog.getText(
@@ -1791,6 +2228,8 @@ class Window(QWidget):
         a_open.triggered.connect(self.open_project)
         a_delete.triggered.connect(self.delete_project)
         a_import.triggered.connect(self.import_backup)
+        a_versions = QAction("历史版本…", self)
+        a_versions.triggered.connect(self.open_versions)
         m.addAction(a_rename)
         m.addSeparator()
         m.addAction(a_new)
@@ -1798,13 +2237,13 @@ class Window(QWidget):
         m.addAction(a_delete)
         m.addSeparator()
         m.addAction(a_import)
+        m.addAction(a_versions)
         btn = self.titlebar.works_btn
         m.exec(btn.mapToGlobal(btn.rect().bottomLeft()))
 
     def _confirm_discard(self) -> bool:
         if not self._dirty:
             return True
-        from PyQt6.QtWidgets import QMessageBox
         r = QMessageBox.question(
             self, "还有未保存的改动",
             "当前作品有改动尚未写入磁盘。继续将先保存它。",
@@ -1822,7 +2261,6 @@ class Window(QWidget):
         if not items:
             self.desk.set_status("还没有其它作品")
             return
-        from PyQt6.QtWidgets import QInputDialog
         labels = [f"{t}   （{i}）" for i, t in items]
         choice, ok = QInputDialog.getItem(self, "打开作品", "选择：", labels, 0, False)
         if not ok:
@@ -1837,14 +2275,12 @@ class Window(QWidget):
 
     def delete_project(self) -> None:
         """删除一部作品（含备份）。当前作品被删则切到剩余作品或新建。"""
-        from PyQt6.QtWidgets import QMessageBox
 
         items = store.list_projects()
         if not items:
             self.desk.set_status("还没有可删除的作品")
             return
 
-        from PyQt6.QtWidgets import QInputDialog
         labels = [f"{t}   （{i}）" for i, t in items]
         choice, ok = QInputDialog.getItem(self, "删除作品", "选择要删除的作品：", labels, 0, False)
         if not ok:
@@ -1903,16 +2339,12 @@ class Window(QWidget):
     def _after_switch(self) -> None:
         """换了作品之后，把界面整个重建一遍。"""
         T.set_palette(self.project.settings.theme)
-        app = QApplication.instance()
-        if app is not None:
-            app.setStyleSheet(
-                T.build_qss(editor_size=self.project.settings.editor_size)
-            )
+        self._apply_qss()
         self.titlebar.sync_theme_label()
         self._stream_target = "paper"
-        if self._result is not None:
-            self._result.close()
-            self._result = None
+        self._result = None
+        self._stats = None
+        self._versions = None
         self._load_all(first=True)
         self.project.save()
         self._dirty = False
@@ -2022,11 +2454,7 @@ class Window(QWidget):
     def cycle_theme(self) -> None:
         T.set_palette(T.next_palette())
         self.project.settings.theme = T.current_palette()
-        app = QApplication.instance()
-        if app is not None:
-            app.setStyleSheet(
-                T.build_qss(editor_size=self.project.settings.editor_size)
-            )
+        self._apply_qss()
         self.titlebar.sync_theme_label()
         self.desk.refresh_meta(self.project)
         self.desk.set_status(f"配色：{T.label_for(T.current_palette())}")
@@ -2037,11 +2465,7 @@ class Window(QWidget):
         d = SettingsDialog(self, self.project.settings)
         if d.exec() == QDialog.DialogCode.Accepted:
             self.project.settings = d.result_settings()
-            app = QApplication.instance()
-            if app is not None:
-                app.setStyleSheet(
-                    T.build_qss(editor_size=self.project.settings.editor_size)
-                )
+            self._apply_qss()
             self.desk.refresh_meta(self.project)
             if self.project.settings.target_chars:
                 self.desk.set_target(self.project.settings.target_chars)
@@ -2079,17 +2503,26 @@ class Window(QWidget):
         else:
             self._launch(body, renew=True)
 
+    def _begin_stream(self, target: str, status: str) -> None:
+        """起一次流式任务：清停止信号、建句柄、切忙碌态。"""
+        self._stop.clear()
+        self._handle = AI.StreamHandle()
+        self._pending_delta.clear()   # 上一任务若未排净，别串到这次的内容里
+        self._busy = True
+        self.desk.set_busy(True)
+        self.desk.set_status(status)
+        self._stream_target = target
+        self._rewrite_wrote = False
+
     def _start_opening(self) -> None:
         """开篇生成：按右栏「故事设定」起名、写第一章开头（仅限空白正文）。"""
         if self._busy or not self._guard_key():
             return
         self._stash()
         p = self.project
-        self.inspector.premise.setPlainText(self.inspector.premise.toPlainText())
         p.premise = self.inspector.premise.toPlainText()
         # 允许全空：没有任何设定时，由 AI 从零发挥。
         if p.chapter.body.strip():
-            from PyQt6.QtWidgets import QMessageBox
             r = QMessageBox.question(
                 self, "开篇生成",
                 "当前章节已有正文。开篇生成会从光标处续入，可能与前文风格不一。继续吗？",
@@ -2112,15 +2545,10 @@ class Window(QWidget):
         self.desk.set_status("正在取名…")
 
         def work() -> None:
-            try:
-                out = AI.suggest_titles(p, on_step=lambda t: self.bridge.status.emit(t))
-                self.bridge.names_ready.emit(out)
-            except AI.AIError as e:
-                self.bridge.failed.emit(str(e))
-            except Exception as e:  # noqa: BLE001
-                self.bridge.failed.emit(f"{type(e).__name__}: {e}")
+            out = AI.suggest_titles(p, on_step=lambda t: self.bridge.status.emit(t))
+            self.bridge.names_ready.emit(out)
 
-        threading.Thread(target=work, daemon=True).start()
+        self._worker(work)
 
     def _start_generate(self, n: int) -> None:
         """一键生成：连续写作到目标字数，单章超限自动开新章。"""
@@ -2159,12 +2587,7 @@ class Window(QWidget):
         opening: bool = False,
     ) -> None:
         p = self.project
-        self._stop.clear()
-        self._handle = AI.StreamHandle()
-        self._busy = True
-        self.desk.set_busy(True)
-        self.desk.set_status("正在连接…")
-        self._stream_target = "paper"
+        self._begin_stream("paper", "正在连接…")
 
         if truncate_to is not None:
             body = self.desk.paper.body()[:truncate_to]
@@ -2174,35 +2597,80 @@ class Window(QWidget):
         snapshot = AI.build_messages(p, tail=tail, opening=opening)
 
         def work() -> None:
-            try:
-                s = p.settings
-                if renew and AI.needs_renewal(p):
-                    self.bridge.status.emit("上下文接近上限 —— 正在压缩前情…")
+            s = p.settings
+            if renew and AI.needs_renewal(p):
+                self.bridge.status.emit("上下文接近上限 —— 正在压缩前情…")
+                with self._plock:
                     AI.renew_memory(p, on_step=lambda t: self.bridge.status.emit(t))
-                    snapshot[:] = AI.build_messages(p, tail=p.chapter.body)
-                    self.bridge.status.emit("记忆已更新，继续续写…")
+                snapshot[:] = AI.build_messages(p, tail=p.chapter.body)
+                self.bridge.status.emit("记忆已更新，继续续写…")
 
-                self.bridge.status.emit("正在续写…")
-                first = True
-                for piece in AI.stream_completion(
-                    s, snapshot, handle=self._handle,
-                    should_stop=self._stop.is_set, target_chars=target_chars,
-                    on_retry=lambda n, w: self.bridge.status.emit(
-                        f"接口限流，第 {n} 次重试（{w:.0f}s 后）…"
-                    ),
-                    on_round=lambda n: self._mark_round(n),
-                ):
-                    if first:
-                        self.bridge.status.emit("")
-                        first = False
-                    self.bridge.delta.emit(piece)
-                self.bridge.done.emit()
-            except AI.AIError as e:
-                self.bridge.failed.emit(str(e))
-            except Exception as e:  # noqa: BLE001
-                self.bridge.failed.emit(f"{type(e).__name__}: {e}")
+            self.bridge.status.emit("正在续写…")
+            first = True
+            for piece in AI.stream_completion(
+                s, snapshot, handle=self._handle,
+                should_stop=self._stop.is_set, target_chars=target_chars,
+                on_retry=lambda n, w: self.bridge.status.emit(
+                    f"接口限流，第 {n} 次重试（{w:.0f}s 后）…"
+                ),
+                on_round=lambda n: self._mark_round(n),
+            ):
+                if first:
+                    self.bridge.status.emit("")
+                    first = False
+                self.bridge.delta.emit(piece)
+            self.bridge.done.emit()
 
-        threading.Thread(target=work, daemon=True).start()
+        self._worker(work)
+
+    def _start_rewrite(self, mode: str) -> None:
+        """就地改写选中的一段：润色 / 扩写 / 缩写 / 重写。
+
+        为什么不是一个新窗口：改写是「改稿」，眼睛必须盯着上下文。文字在原地
+        一句句长出来，才知道改完是否接得住上一段。
+        """
+        if self._busy or not self._guard_key():
+            return
+        paper = self.desk.paper
+        cur = paper.textCursor()
+        if not cur.hasSelection():
+            self.desk.set_status("先选中一段文字，再走右键菜单或「更多 → AI 改写」")
+            return
+
+        body = paper.body()
+        start, end = cur.selectionStart(), cur.selectionEnd()
+        selection = body[start:end].strip()
+        if len(selection) < 8:
+            self.desk.set_status("选中的文字太少，改写没有意义")
+            return
+
+        p = self.project
+        p.chapter.title = self.desk.title.text().strip() or "未命名"
+        p.chapter.body = body
+
+        label, _ = AI.REWRITE_MODES.get(mode, AI.REWRITE_MODES["polish"])
+        self._rewrite_label = label
+        self._begin_stream("rewrite", f"正在{label}…")
+
+        # 上下文与「腾位置」都在发起前算好：一旦删掉选区，原文就只剩下面
+        # Manuscript 里留的那一份副本。
+        messages = AI.build_rewrite_messages(
+            p, selection, mode, before=body[:start], after=body[end:]
+        )
+        paper.begin_rewrite()
+
+        def work() -> None:
+            for piece in AI.stream_completion(
+                p.settings, messages, handle=self._handle,
+                should_stop=self._stop.is_set,
+                on_retry=lambda n, w: self.bridge.status.emit(
+                    f"接口限流，第 {n} 次重试（{w:.0f}s 后）…"
+                ),
+            ):
+                self.bridge.delta.emit(piece)
+            self.bridge.done.emit()
+
+        self._worker(work)
 
     # ── 流式回调 ──
     def _on_delta(self, piece: str) -> None:
@@ -2224,6 +2692,10 @@ class Window(QWidget):
             return
         text = "".join(self._pending_delta)
         self._pending_delta.clear()
+        if self._stream_target == "rewrite":
+            self.desk.paper.put_rewrite(text)
+            self._rewrite_wrote = True
+            return
         if self._round_status and not self._gen_active:
             self._round_status = False
             self.desk.set_status("")
@@ -2278,6 +2750,16 @@ class Window(QWidget):
         self._busy = False
         self.desk.set_busy(False)
 
+        if self._stream_target == "rewrite":
+            self.desk.paper.end_rewrite()
+            self.project.chapter.body = self.desk.paper.body()
+            self.desk.refresh_meta(self.project)
+            self.rail.load(self.project.chapters, self.project.current)
+            self.desk.set_status(f"{self._rewrite_label}完成")
+            self._dirty = True
+            self._save()
+            return
+
         if self._stream_target in ("dialog", "reformat"):
             if self._result is not None:
                 self._result.finish()
@@ -2322,7 +2804,9 @@ class Window(QWidget):
             done = 0
             try:
                 for body in pending:
-                    AI.summarize_chapter(p, body)
+                    # 与主线程 autosave 争同一个 Project，必须排它
+                    with self._plock:
+                        AI.summarize_chapter(p, body)
                     done += 1
             except Exception as e:  # noqa: BLE001
                 # 失败的部分留在队列里，下次生成结束再试，不丢内容
@@ -2332,10 +2816,11 @@ class Window(QWidget):
             self._pending_summaries[:] = []
             self.bridge.memory_ready.emit(p.memory)
 
-        threading.Thread(target=work, daemon=True).start()
+        self._worker(work)
 
     def _on_memory_ready(self, text: str) -> None:
-        self.inspector.show_tab(3)
+        # 右栏是「语料 / 设定 / 记忆」三页，索引从 0 起 —— 记忆是第 2 页。
+        self.inspector.show_tab(2)
         self.inspector.memory.setPlainText(text)
         self.project.memory = text
         self.desk.set_status("前情记忆已更新")
@@ -2348,7 +2833,6 @@ class Window(QWidget):
 
     def _on_names_ready(self, text: str) -> None:
         """解析候选书名，弹窗让作者点选，选中即改作品名。"""
-        import re
         titles: list[str] = []
         for line in text.splitlines():
             line = line.strip()
@@ -2368,7 +2852,6 @@ class Window(QWidget):
             self.desk.set_status("没能解析出书名，请重试")
             return
 
-        from PyQt6.QtWidgets import QInputDialog
         cur = self.project.title
         choice, ok = QInputDialog.getItem(
             self, "选择书名", "候选书名：", titles, 0, False
@@ -2405,40 +2888,42 @@ class Window(QWidget):
         self._busy = False
         self._gen_active = False
         self.desk.set_busy(False)
+
         if self._stream_target in ("dialog", "reformat"):
             if self._result is not None:
                 self._result.fail(msg)
-        else:
-            self.desk.paper.end_stream()
-            # 中断前已翻页的章节照样进记忆
-            self._flush_summaries()
+            self.desk.set_status(msg)
+            return
+
+        if self._stream_target == "rewrite":
+            # 失败也得让稿面回到可用状态：一个字没出就把原文放回去，
+            # 出了字则保留已有成果 —— 半截版本也胜过把选段凭空弄丢。
+            if self._rewrite_wrote:
+                self.desk.paper.end_rewrite()
+                note = f"{self._rewrite_label}中断：{msg}（已保留已生成的部分）"
+            else:
+                self.desk.paper.restore_rewrite()
+                note = f"{self._rewrite_label}失败：{msg}（原文未改动）"
+            self.project.chapter.body = self.desk.paper.body()
+            self.desk.refresh_meta(self.project)
+            self.desk.set_status(note)
+            return
+
+        self.desk.paper.end_stream()
+        # 中断前已翻页的章节照样进记忆
+        self._flush_summaries()
         self.desk.set_status(msg)
 
     # ══════════════ 重排段落 ══════════════
 
     def _backup(self) -> None:
-        """落盘前先把当前项目另存一份，最多保留 20 份。"""
-        import time
-        folder = os.path.join(store.PROJECTS_DIR, "backup")
+        """替换正文这类高风险操作前，先手动留一个快照。
+
+        与自动轮转共用 store.snapshot —— 两处各写一份规则早晚会漂移。
+        """
         try:
-            os.makedirs(folder, exist_ok=True)
             self.project.save()
-            with open(self.project.path(), encoding="utf-8") as f:
-                data = f.read()
-            stamp = time.strftime("%Y%m%d-%H%M%S")
-            dst = os.path.join(folder, f"{self.project.id}-{stamp}.json")
-            with open(dst, "w", encoding="utf-8") as f:
-                f.write(data)
-            # 只保留最近 20 份
-            files = sorted(
-                (f for f in os.listdir(folder) if f.startswith(self.project.id)),
-                reverse=True,
-            )
-            for old in files[20:]:
-                try:
-                    os.remove(os.path.join(folder, old))
-                except OSError:
-                    pass
+            store.snapshot(self.project.id)
         except OSError as e:
             self.desk.set_status(f"备份失败：{e}")
 
@@ -2459,21 +2944,15 @@ class Window(QWidget):
         self._result = ResultDialog(self, "重排段落 —— 只调整换行，不改一个字")
         self._result.use_btn.setText("替换正文")
         self._result.append_to_brief.connect(self._apply_reformat)
+        self._result.closed.connect(self._forget_result)
         self._result.show()
 
         def work() -> None:
-            try:
-                out = AI.reformat_chapter(
-                    p, on_step=lambda t: self.bridge.status.emit(t)
-                )
-                self.bridge.delta.emit(out)
-                self.bridge.done.emit()
-            except AI.AIError as e:
-                self.bridge.failed.emit(str(e))
-            except Exception as e:  # noqa: BLE001
-                self.bridge.failed.emit(f"{type(e).__name__}: {e}")
+            out = AI.reformat_chapter(p, on_step=lambda t: self.bridge.status.emit(t))
+            self.bridge.delta.emit(out)
+            self.bridge.done.emit()
 
-        threading.Thread(target=work, daemon=True).start()
+        self._worker(work)
 
     def _apply_reformat(self, text: str) -> None:
         text = text.strip()
@@ -2482,7 +2961,6 @@ class Window(QWidget):
         if not self._result:
             return
         # 二次确认，因为会整体替换
-        from PyQt6.QtWidgets import QMessageBox
         r = QMessageBox.question(
             self, "替换正文",
             "将用重排后的版本替换当前章节正文。原稿会先备份到 projects/backup/。",
@@ -2518,15 +2996,10 @@ class Window(QWidget):
         self.desk.set_status("正在补全设定…")
 
         def work() -> None:
-            try:
-                out = AI.expand_settings(p, on_step=lambda t: self.bridge.status.emit(t))
-                self.bridge.settings_ready.emit(out)
-            except AI.AIError as e:
-                self.bridge.failed.emit(str(e))
-            except Exception as e:  # noqa: BLE001
-                self.bridge.failed.emit(f"{type(e).__name__}: {e}")
+            out = AI.expand_settings(p, on_step=lambda t: self.bridge.status.emit(t))
+            self.bridge.settings_ready.emit(out)
 
-        threading.Thread(target=work, daemon=True).start()
+        self._worker(work)
 
     def _start_analysis(self) -> None:
         if self._busy or not self._guard_key():
@@ -2548,15 +3021,10 @@ class Window(QWidget):
         p = self.project
 
         def work() -> None:
-            try:
-                out = AI.analyze_corpus(p, on_step=lambda t: self.bridge.status.emit(t))
-                self.bridge.settings_ready.emit(out)
-            except AI.AIError as e:
-                self.bridge.failed.emit(str(e))
-            except Exception as e:  # noqa: BLE001
-                self.bridge.failed.emit(f"{type(e).__name__}: {e}")
+            out = AI.analyze_corpus(p, on_step=lambda t: self.bridge.status.emit(t))
+            self.bridge.settings_ready.emit(out)
 
-        threading.Thread(target=work, daemon=True).start()
+        self._worker(work)
 
     # ══════════════ 窗口事件 ══════════════
 
@@ -2576,8 +3044,9 @@ class Window(QWidget):
                 self._start_write()
             return
         if key == Qt.Key.Key_Escape and self._busy:
-            self._stop.set()
-            self.desk.set_status("正在停止…")
+            # 走完整的停止流程：只置标志位掐不断 socket，服务器不发下一帧时
+            # 读取线程会一直阻塞，Esc 看起来就像没反应。
+            self._request_stop()
             return
         if ctrl and key == Qt.Key.Key_N:
             self._add_chapter()

@@ -343,6 +343,18 @@ check("系统提示里不再有矛盾的「5 到 10 段」", "5 到 10" not in A
 check("系统提示不再要求「自然收束」", "自然收束" not in AI.SYSTEM_PROMPT)
 check("系统提示要求这一段有事发生", "有事发生" in AI.SYSTEM_PROMPT)
 
+print("\n[10b] 文风禁区：三处提示词共用同一份定义")
+# 反 AI 腔规则若只挂在续写上，改写与开篇照样产出套话。
+check("续写提示含文风禁区", AI.STYLE_BAN.strip() in AI.SYSTEM_PROMPT)
+check("开篇提示含文风禁区", AI.STYLE_BAN.strip() in AI.OPENING_PROMPT)
+check("改写提示含文风禁区", AI.STYLE_BAN.strip() in AI.REWRITE_PROMPT)
+check("套话黑名单进了续写提示", "眼中闪过一丝" in AI.SYSTEM_PROMPT)
+check("文风禁区里没有篇幅指令（不许再分叉）",
+      "自然段" not in AI.STYLE_BAN and "个自然段" not in AI.STYLE_BAN)
+rw = AI.build_rewrite_messages(p, "他走了进来。", "polish", before="", after="")
+check("改写上下文的系统提示带禁区",
+      AI.STYLE_BAN.strip() in rw[0]["content"])
+
 print("\n[11] 设置面板带上了三个新参数")
 p.settings.temperature = 1.11
 p.settings.presence_penalty = 0.55

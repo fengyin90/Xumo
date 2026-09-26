@@ -1,0 +1,6 @@
+# 运行时依赖：整个程序只有界面库这一个第三方包。
+# ai.py 的流式请求、store.py 的数据模型、theme.py 的样式表全部只用标准库。
+PyQt6>=6.5
+
+# 打包成 exe 另需（不装也能跑源码）：
+#   pip install pyinstaller

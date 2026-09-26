@@ -1,0 +1,18 @@
+# 作品数据：含 API Key 与小说正文，绝不入库
+projects/
+
+# 打包产物
+build/
+dist/
+*.spec
+
+# Python 编译产物
+__pycache__/
+*.pyc
+
+# 杂项
+_t.py
+_top.png
+
+# 开发过程记录（内部笔记，不随仓库发布）
+.workbuddy/

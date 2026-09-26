@@ -69,6 +69,8 @@ class Settings:
     # 单章字数上限；超出后自动开启新章继续。0 表示不限
     chapter_max: int = 5000
     theme: str = "blue"
+    # 编辑区正文字号（px）
+    editor_size: int = 16
     # 阅读窗口正文字号
     reader_size: int = 17
     # 阅读窗口上次停留的章节序号与滚动位置（关窗时写入）

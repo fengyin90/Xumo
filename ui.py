@@ -23,7 +23,7 @@ from PyQt6.QtGui import (
     QAction, QColor, QCursor, QFont, QKeySequence, QTextBlockFormat, QTextCursor,
 )
 from PyQt6.QtWidgets import (
-    QApplication, QButtonGroup, QCheckBox, QDialog, QDoubleSpinBox, QFileDialog,
+    QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QDialog, QDoubleSpinBox, QFileDialog,
     QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMenu, QPlainTextEdit, QPushButton, QSizeGrip, QSpinBox,
     QStackedWidget, QTextEdit, QVBoxLayout, QWidget,
@@ -327,11 +327,41 @@ class TitleBar(QWidget):
 #  左栏：目录
 # ══════════════════════════════════════════════════════════
 
+class ChapterList(QListWidget):
+    """章节列表：支持拖拽排序。
+
+    drop 完成后回读顺序，而非监听 model 的 rowsMoved —— QListWidget 的
+    内部移动在部分实现里以「插入 + 删除」完成，rowsMoved 不一定触发。
+    dropEvent 期间抑制 currentRowChanged，避免拖拽引发的选中变化被当成「切换章节」。
+    """
+
+    reordered = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.setDragEnabled(True)
+        self.setAcceptDrops(True)
+        self.setDropIndicatorShown(True)
+        self.suppressing = False
+
+    def dropEvent(self, e) -> None:
+        self.suppressing = True
+        try:
+            super().dropEvent(e)
+        finally:
+            self.suppressing = False
+        self.reordered.emit()
+
+
 class Rail(QWidget):
     picked = pyqtSignal(int)
     added = pyqtSignal()
     renamed = pyqtSignal(int, str)
     removed = pyqtSignal(int)
+    reordered = pyqtSignal(list)
+    merged = pyqtSignal(int, int)
 
     def __init__(self):
         super().__init__()
@@ -351,12 +381,13 @@ class Rail(QWidget):
         head.addWidget(self.count)
         col.addLayout(head)
 
-        self.list = QListWidget()
+        self.list = ChapterList()
         self.list.setObjectName("Chapters")
         self.list.setFrameShape(QFrame.Shape.NoFrame)
         self.list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.list.customContextMenuRequested.connect(self._menu)
         self.list.currentRowChanged.connect(self._on_row)
+        self.list.reordered.connect(self._on_reorder)
         col.addWidget(self.list, 1)
 
         col.addWidget(rule(soft=True))
@@ -369,8 +400,16 @@ class Rail(QWidget):
         col.addLayout(foot)
 
     def _on_row(self, row: int) -> None:
-        if row >= 0:
+        if row >= 0 and not self.list.suppressing:
             self.picked.emit(row)
+
+    def _on_reorder(self) -> None:
+        """拖拽结束后，按列表当前顺序回读章节 id。"""
+        ids = [
+            self.list.item(i).data(Qt.ItemDataRole.UserRole)
+            for i in range(self.list.count())
+        ]
+        self.reordered.emit(ids)
 
     def load(self, chapters: list[Chapter], current: int) -> None:
         self.list.blockSignals(True)
@@ -378,6 +417,12 @@ class Rail(QWidget):
         for i, ch in enumerate(chapters, 1):
             it = QListWidgetItem(f"{i:02d}   {ch.title}")
             it.setToolTip(f"{ch.words():,} 字")
+            it.setData(Qt.ItemDataRole.UserRole, ch.id)
+            it.setFlags(
+                it.flags()
+                | Qt.ItemFlag.ItemIsDragEnabled
+                | Qt.ItemFlag.ItemIsDropEnabled
+            )
             self.list.addItem(it)
         self.list.setCurrentRow(current)
         self.list.blockSignals(False)
@@ -388,6 +433,7 @@ class Rail(QWidget):
         if it is None:
             return
         row = self.list.row(it)
+        last = self.list.count() - 1
         m = QMenu(self)
         a1 = QAction("重命名", self)
         a2 = QAction("删除本章", self)
@@ -395,11 +441,21 @@ class Rail(QWidget):
         a2.triggered.connect(lambda: self.removed.emit(row))
         m.addAction(a1)
         m.addAction(a2)
+        if row > 0 or row < last:
+            m.addSeparator()
+        if row > 0:
+            a3 = QAction("并入上一章", self)
+            a3.triggered.connect(lambda: self.merged.emit(row - 1, row))
+            m.addAction(a3)
+        if row < last:
+            a4 = QAction("并入下一章", self)
+            a4.triggered.connect(lambda: self.merged.emit(row, row + 1))
+            m.addAction(a4)
         m.exec(self.list.mapToGlobal(pos))
 
     def _rename(self, row: int) -> None:
         from PyQt6.QtWidgets import QInputDialog
-        cur = self.list.item(row).text()[6:]
+        cur = self.list.item(row).text().split("   ", 1)[-1]
         name, ok = QInputDialog.getText(self, "重命名章节", "标题：", text=cur)
         if ok and name.strip():
             self.renamed.emit(row, name.strip())
@@ -772,6 +828,10 @@ class ReaderWindow(QDialog):
         self.crumb = QLabel("")
         self.crumb.setObjectName("Crumb")
         bar.addWidget(self.crumb)
+
+        self.progress = QLabel("")
+        self.progress.setObjectName("FieldLabel")
+        bar.addWidget(self.progress)
         bar.addStretch(1)
 
         self.smaller = ghost_button("A－")
@@ -853,23 +913,31 @@ class ReaderWindow(QDialog):
 
         # 滚动位置需等文档布局完成才能落 —— 布局就绪前 scrollbar 上限是 0。
         # 用定时轮询而非布局信号：后者触发时机在不同平台不稳。
-        self._pending_scroll = int(project.settings.reader_scroll or 0)
+        self._scroll_mem: dict[int, int] = {}
+        self._cur_row = -1
+        self._pending_scroll = 0
         self._scroll_tries = 0
         self._scroll_timer = QTimer(self)
         self._scroll_timer.setInterval(30)
         self._scroll_timer.timeout.connect(self._try_restore_scroll)
 
+        # 上次读到的那一章连同它的滚动位置，一并放进记忆
+        if project.settings.reader_scroll:
+            first = max(0, min(int(project.settings.reader_chapter or 0), len(project.chapters) - 1))
+            self._scroll_mem[first] = int(project.settings.reader_scroll)
+
         self._load_list()
         self._apply_font()
+
+        # 键盘翻页 / 翻章 —— 不必再回到滚轮
+        self.view.installEventFilter(self)
+        self.view.verticalScrollBar().valueChanged.connect(self._update_progress)
 
         # 轮询鼠标位置驱动自动隐藏（不依赖事件在 QTextEdit 里的传递）
         self._poll = QTimer(self)
         self._poll.setInterval(120)
         self._poll.timeout.connect(self._track)
         self._poll.start()
-
-        if self._pending_scroll > 0:
-            self._scroll_timer.start()
 
     def _load_list(self) -> None:
         p = self.project
@@ -888,11 +956,49 @@ class ReaderWindow(QDialog):
     def _show(self, row: int) -> None:
         if row < 0 or row >= len(self.project.chapters):
             return
+        # 离开上一章前，先记住它读到哪儿
+        if self._cur_row >= 0:
+            self._scroll_mem[self._cur_row] = self.view.verticalScrollBar().value()
+        self._cur_row = row
+
         ch = self.project.chapters[row]
         self.view.setPlainText(ch.body or "（本章尚无内容）")
+        self._apply_rhythm()
         self.view.moveCursor(QTextCursor.MoveOperation.Start)
-        self.view.verticalScrollBar().setValue(0)
         self.crumb.setText(f"第 {row + 1} / {len(self.project.chapters)} 章 · {len(ch.body):,} 字")
+
+        # 恢复这一章上次的阅读位置；没有就从头
+        self._pending_scroll = int(self._scroll_mem.get(row, 0) or 0)
+        self._scroll_tries = 0
+        if self._pending_scroll > 0:
+            self.view.verticalScrollBar().setValue(0)
+            self._scroll_timer.start()
+        else:
+            self.view.verticalScrollBar().setValue(0)
+            self._update_progress()
+
+    def _apply_rhythm(self) -> None:
+        """给正文施加行距与段距。
+
+        QSS 的 line-height 对 QTextEdit 无效，行距只能靠块格式施加 ——
+        否则长篇正文挤成单倍行距，读起来很累。
+        """
+        cur = self.view.textCursor()
+        cur.select(QTextCursor.SelectionType.Document)
+        f = QTextBlockFormat()
+        f.setLineHeight(190, QTextBlockFormat.LineHeightTypes.ProportionalHeight.value)
+        f.setBottomMargin(16)
+        f.setTopMargin(0)
+        cur.mergeBlockFormat(f)
+        cur.clearSelection()
+
+    def _update_progress(self) -> None:
+        bar = self.view.verticalScrollBar()
+        if bar.maximum() <= 0:
+            self.progress.setText("")
+            return
+        pct = round(bar.value() / bar.maximum() * 100)
+        self.progress.setText(f"已读 {pct}%")
 
     def _try_restore_scroll(self) -> None:
         """轮询直到滚动条上限足够，放下上次的滚动位置，然后停。"""
@@ -904,10 +1010,53 @@ class ReaderWindow(QDialog):
             bar.setValue(self._pending_scroll)
             self._pending_scroll = 0
             self._scroll_timer.stop()
+            self._update_progress()
             return
         self._scroll_tries += 1
         if self._scroll_tries > 40:      # 约 1.2 秒仍不够（如本章很短），放弃
             self._scroll_timer.stop()
+
+    # ── 键盘 ──
+    def eventFilter(self, obj, e) -> bool:
+        if obj is not self.view or e.type() != QEvent.Type.KeyPress:
+            return super().eventFilter(obj, e)
+        key = e.key()
+        page = self.view.verticalScrollBar().pageStep()
+        if key in (Qt.Key.Key_Space, Qt.Key.Key_PageDown):
+            self._scroll_by(page)
+            return True
+        if key in (Qt.Key.Key_PageUp,):
+            self._scroll_by(-page)
+            return True
+        if key == Qt.Key.Key_Down:
+            self._scroll_by(60)
+            return True
+        if key == Qt.Key.Key_Up:
+            self._scroll_by(-60)
+            return True
+        if key == Qt.Key.Key_Right:
+            self._step_chapter(1)
+            return True
+        if key == Qt.Key.Key_Left:
+            self._step_chapter(-1)
+            return True
+        if key == Qt.Key.Key_Home:
+            self.view.verticalScrollBar().setValue(0)
+            return True
+        if key == Qt.Key.Key_End:
+            bar = self.view.verticalScrollBar()
+            bar.setValue(bar.maximum())
+            return True
+        return super().eventFilter(obj, e)
+
+    def _scroll_by(self, delta: int) -> None:
+        bar = self.view.verticalScrollBar()
+        bar.setValue(bar.value() + delta)
+
+    def _step_chapter(self, delta: int) -> None:
+        row = max(0, min(self.list.currentRow() + delta, self.list.count() - 1))
+        if row != self.list.currentRow():
+            self.list.setCurrentRow(row)
 
     def _bump(self, delta: int) -> None:
         new = max(self.SIZE_MIN, min(self.SIZE_MAX, self._size + delta))
@@ -966,10 +1115,13 @@ class ReaderWindow(QDialog):
     def closeEvent(self, e) -> None:
         self._poll.stop()
         self._scroll_timer.stop()
-        # 记住读到哪儿，下次打开接着看
+        # 记住读到哪儿（当前章的滚动位置），下次打开接着看
         s = self.project.settings
-        s.reader_chapter = max(0, self.list.currentRow())
-        s.reader_scroll = self.view.verticalScrollBar().value()
+        row = max(0, self.list.currentRow())
+        if self._cur_row >= 0:
+            self._scroll_mem[self._cur_row] = self.view.verticalScrollBar().value()
+        s.reader_chapter = row
+        s.reader_scroll = int(self._scroll_mem.get(row, 0) or 0)
         self.project.save()
         w = self.parent()
         if w is not None and getattr(w, "_reader", None) is self:
@@ -977,15 +1129,16 @@ class ReaderWindow(QDialog):
         super().closeEvent(e)
 
     def _apply_font(self) -> None:
+        # 行距不能靠 QSS（对 QTextEdit 无效），改由块格式施加，见 _apply_rhythm。
         self.view.setStyleSheet(
             f"QTextEdit#Reader {{"
             f" background: transparent; border: none;"
             f" font-family: {T.SERIF};"
             f" font-size: {self._size}px;"
-            f" line-height: 190%;"
             f" padding: {T.GAP_LG}px {T.GAP_XL}px;"
             f"}}"
         )
+        self._apply_rhythm()
 
 
 # ══════════════════════════════════════════════════════════
@@ -1164,6 +1317,12 @@ class SettingsDialog(QDialog):
         self.tchars.setValue(s.target_chars)
         add("默认生成字数", self.tchars)
 
+        self.font = QSpinBox()
+        self.font.setRange(12, 28)
+        self.font.setSingleStep(1)
+        self.font.setValue(getattr(s, "editor_size", 16) or 16)
+        add("正文字号", self.font)
+
         note = hint("预算以「字」计。正文超出上下文预算后，旧情节会自动压缩进前情记忆。单章上限控制「一键生成」时自动开新章的字数。")
         note.setWordWrap(True)
         g.addWidget(note, r, 0, 1, 2)
@@ -1181,7 +1340,19 @@ class SettingsDialog(QDialog):
         g.addLayout(bar, r, 0, 1, 2)
 
     def result_settings(self) -> Settings:
+        # 保留原样、本对话框不涉及的字段：theme / editor_size / reader_*。
+        # 直接构造 Settings 会把这些重置为默认值 —— 例如保存设置后配色丢失。
+        keep = {
+            k: getattr(self.s, k)
+            for k in Settings.__dataclass_fields__
+            if k not in {
+                "base_url", "api_key", "model", "temperature", "max_tokens",
+                "context_budget", "corpus_budget", "target_chars", "chapter_max",
+                "editor_size",
+            }
+        }
         return Settings(
+            **keep,
             base_url=self.url.text().strip() or "https://api.deepseek.com/v1",
             api_key=self.key.text().strip(),
             model=self.model.text().strip() or "deepseek-chat",
@@ -1191,6 +1362,7 @@ class SettingsDialog(QDialog):
             corpus_budget=int(self.cor.value()),
             target_chars=int(self.tchars.value()),
             chapter_max=int(self.chmax.value()),
+            editor_size=int(self.font.value()),
         )
 
 
@@ -1218,7 +1390,9 @@ class Window(QWidget):
         T.set_palette(self.project.settings.theme)
         app = QApplication.instance()
         if app is not None:
-            app.setStyleSheet(T.build_qss())
+            app.setStyleSheet(
+                T.build_qss(editor_size=self.project.settings.editor_size)
+            )
 
         self.bridge = Bridge()
         self.bridge.delta.connect(self._on_delta)
@@ -1275,6 +1449,8 @@ class Window(QWidget):
         self.rail.added.connect(self._add_chapter)
         self.rail.renamed.connect(self._rename_chapter)
         self.rail.removed.connect(self._remove_chapter)
+        self.rail.reordered.connect(self._reorder_chapters)
+        self.rail.merged.connect(self._merge_chapters)
         self.desk.write.connect(self._start_write)
         self.desk.link.connect(self._start_link)
         self.desk.reformat.connect(self._start_reformat)
@@ -1301,7 +1477,7 @@ class Window(QWidget):
         # ── 自动保存 ──
         self.autosave = QTimer(self)
         self.autosave.setInterval(8000)
-        self.autosave.timeout.connect(self._save)
+        self.autosave.timeout.connect(self._autosave)
         self.autosave.start()
 
         self._load_all(first=True)
@@ -1322,6 +1498,12 @@ class Window(QWidget):
         self.desk.set_target(p.settings.target_chars or 2000)
         if first:
             self.desk.set_status("就绪" if p.settings.api_key else "先在右下角填写 API Key")
+
+    def _autosave(self) -> None:
+        """定时兜底保存。无改动时跳过 —— 否则每 8 秒都触发一次备份轮转，
+        40 份历史回滚点实际只覆盖几分钟。"""
+        if self._dirty:
+            self._save()
 
     def _save(self) -> None:
         p = self.project
@@ -1411,6 +1593,72 @@ class Window(QWidget):
         self.desk.refresh_meta(p)
         self.titlebar.set_crumb(f"第 {p.current + 1} / {len(p.chapters)} 章")
         self._dirty = True
+
+    def _reorder_chapters(self, ids: list) -> None:
+        """按列表当前顺序（id 序列）重排章节，保持正在编辑的那一章不变。"""
+        p = self.project
+        if len(ids) != len(p.chapters):
+            return
+        by_id = {ch.id: ch for ch in p.chapters}
+        if any(i not in by_id for i in ids):
+            return
+        cur_id = p.chapters[p.current].id
+        p.chapters = [by_id[i] for i in ids]
+        p.current = next((k for k, ch in enumerate(p.chapters) if ch.id == cur_id), 0)
+        self.rail.load(p.chapters, p.current)
+        self.desk.refresh_meta(p)
+        self.titlebar.set_crumb(f"第 {p.current + 1} / {len(p.chapters)} 章")
+        self.desk.set_status("章节顺序已调整")
+        self._dirty = True
+        self._save()
+
+    def _merge_chapters(self, keep_row: int, drop_row: int) -> None:
+        """把 drop_row 的正文接到 keep_row 末尾，然后删除 drop_row。"""
+        p = self.project
+        n = len(p.chapters)
+        if keep_row == drop_row or not (0 <= keep_row < n and 0 <= drop_row < n):
+            return
+        from PyQt6.QtWidgets import QMessageBox
+        keep_title = p.chapters[keep_row].title
+        drop_title = p.chapters[drop_row].title
+        r = QMessageBox.question(
+            self, "合并章节",
+            f"把「{drop_title}」的正文并入「{keep_title}」末尾，并删除前者。\n\n"
+            "原稿会先备份到 projects/backup/。确定吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if r != QMessageBox.StandardButton.Yes:
+            return
+        self._stash()
+        self._backup()
+
+        cur = p.current
+        keep = p.chapters[keep_row]
+        drop = p.chapters[drop_row]
+        head = keep.body.rstrip()
+        tail = drop.body.strip()
+        if tail:
+            keep.body = (head + "\n\n" + tail) if head else tail
+        del p.chapters[drop_row]
+
+        if cur == drop_row:
+            p.current = keep_row
+        elif cur > drop_row:
+            p.current = cur - 1
+        else:
+            p.current = cur
+        p.current = max(0, min(p.current, len(p.chapters) - 1))
+
+        self.rail.load(p.chapters, p.current)
+        # 当前章的内容可能变了（被并入 或 就是被删的那章），重载编辑器
+        if cur == keep_row or cur == drop_row:
+            self.desk.set_chapter(p.chapter)
+        self.desk.refresh_meta(p)
+        self.titlebar.set_crumb(f"第 {p.current + 1} / {len(p.chapters)} 章")
+        self.desk.set_status(f"已把「{drop_title}」并入「{keep_title}」")
+        self._dirty = True
+        self._save()
 
     def _rename_project(self, name: str) -> None:
         self.project.title = name
@@ -1657,7 +1905,9 @@ class Window(QWidget):
         T.set_palette(self.project.settings.theme)
         app = QApplication.instance()
         if app is not None:
-            app.setStyleSheet(T.build_qss())
+            app.setStyleSheet(
+                T.build_qss(editor_size=self.project.settings.editor_size)
+            )
         self.titlebar.sync_theme_label()
         self._stream_target = "paper"
         if self._result is not None:
@@ -1774,7 +2024,9 @@ class Window(QWidget):
         self.project.settings.theme = T.current_palette()
         app = QApplication.instance()
         if app is not None:
-            app.setStyleSheet(T.build_qss())
+            app.setStyleSheet(
+                T.build_qss(editor_size=self.project.settings.editor_size)
+            )
         self.titlebar.sync_theme_label()
         self.desk.refresh_meta(self.project)
         self.desk.set_status(f"配色：{T.label_for(T.current_palette())}")
@@ -1785,6 +2037,11 @@ class Window(QWidget):
         d = SettingsDialog(self, self.project.settings)
         if d.exec() == QDialog.DialogCode.Accepted:
             self.project.settings = d.result_settings()
+            app = QApplication.instance()
+            if app is not None:
+                app.setStyleSheet(
+                    T.build_qss(editor_size=self.project.settings.editor_size)
+                )
             self.desk.refresh_meta(self.project)
             if self.project.settings.target_chars:
                 self.desk.set_target(self.project.settings.target_chars)
@@ -1891,7 +2148,6 @@ class Window(QWidget):
         if len(tail.strip()) < 20:
             self.desk.set_status("把光标放在要接续的位置之后")
             return
-        self.desk.paper.textCursor().removeSelectedText()
         self._launch(tail, renew=False, truncate_to=pos)
 
     def _launch(

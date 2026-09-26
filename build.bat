@@ -1,19 +1,15 @@
 @echo off
-REM ç»­å¢¨ Â· Windows æ‰“åŒ…è„šæœ¬
-REM éœ€è¦å…ˆè£…å¥½ PyInstallerï¼špip install pyinstaller
+chcp 936 >nul
+REM ĞøÄ« ¡ª¡ª Windows ´ò°ü½Å±¾
+REM ĞèÒªÏÈ×°ºÃ PyInstaller£ºpip install pyinstaller
 
-echo [1/2] æ¸…ç†æ—§äº§ç‰©...
+echo [1/2] ÇåÀí¾É²úÎï...
 if exist build rmdir /s /q build
 if exist dist rmdir /s /q dist
 
-echo [2/2] å¼€å§‹æ‰“åŒ…...
-pyinstaller --noconfirm --clean ^
-  --name Xumo ^
-  --onefile ^
-  --windowed ^
-  --noconsole ^
-  main.py
+echo [2/2] ¿ªÊ¼´ò°ü...
+pyinstaller --noconfirm --clean --name Xumo --onefile --windowed --noconsole main.py
 
 echo.
-echo å®Œæˆã€‚å¯æ‰§è¡Œæ–‡ä»¶åœ¨ dist\Xumo.exe
+echo Íê³É¡£¿ÉÖ´ĞĞÎÄ¼şÔÚ dist\Xumo.exe
 pause

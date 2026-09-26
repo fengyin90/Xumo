@@ -100,9 +100,44 @@ PALETTES: dict[str, dict] = {
         "selection":   "rgba(176, 80, 106, 0.22)",
         "busy_text":  "#9A8781",
     },
+    "night": {
+        "label": "夜墨",
+        "canvas": ("#1A1D23", "#181B21", "#15181D"),
+        "rail":   ("#22262E", "#1E222A"),
+        "desk":   ("#1E222A", "#1C2027", "#191D24"),
+        "text":       "#DDE2EA",
+        "text_dim":   "#A3ACBA",
+        "text_faint": "#767F8D",
+        "rule":       "#2E343D",
+        "rule_soft":  "#262B33",
+        "hover":      "#282D36",
+        "input_bg":   "#232830",
+        "selected":   "#282D36",
+        "accent":     "#6E9BEA",
+        "accent_hi":  "#8BB0F0",
+        "accent_dim": "#4E6D9E",
+        "on_accent":  "#0F1216",
+        "danger":     "#D9695A",
+        "scrim":       "rgba(255, 255, 255, 0.022)",
+        "scrim_focus": "rgba(255, 255, 255, 0.042)",
+        "selection":   "rgba(110, 155, 234, 0.28)",
+        "busy_text":  "#6E7889",
+    },
 }
 
 _current = "blue"
+
+# 编辑区正文字号（px）。由 Settings 注入，随配色一起作用于全局样式表。
+_editor_size = 16
+
+
+def set_editor_size(size: int) -> None:
+    global _editor_size
+    _editor_size = max(12, min(28, int(size)))
+
+
+def editor_size() -> int:
+    return _editor_size
 
 
 def set_palette(name: str) -> None:
@@ -160,9 +195,11 @@ TITLEBAR_H = 54    # 计入首屏预算
 MEASURE = 680
 
 
-def build_qss() -> str:
+def build_qss(editor_size: int | None = None) -> str:
     """全局样式表。无阴影、无卡片；区块感来自亮度差与分隔线。"""
     p = PALETTES[_current]
+    if editor_size is not None:
+        set_editor_size(editor_size)
     arrow_up = _arrow(p["text_dim"], up=True)
     arrow_dn = _arrow(p["text_dim"], up=False)
 
@@ -248,7 +285,7 @@ QTextEdit#Manuscript {{
     background: transparent;
     border: none;
     font-family: {SERIF};
-    font-size: 16px;
+    font-size: {_editor_size}px;
     line-height: 200%;
     color: {p["text"]};
     selection-background-color: {p["selection"]};

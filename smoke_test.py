@@ -63,6 +63,27 @@ eq("折叠整块复述", blocks, "甲" * 40 + "\n\n" + "乙" * 40)
 keep = "\n\n".join([f"第{i}段内容足够长以参与判重" for i in range(6)])
 eq("不误删相邻但不同的段落", AI.collapse_blocks(keep), keep)
 
+# 同秒多份快照 + 超额轮转：必须删最早的，不能把较新的删掉
+_bpid = "prune0001"
+_bdir = store.backup_dir()
+os.makedirs(_bdir, exist_ok=True)
+_bt = time.time() - 3600
+_bfiles = []
+for _k in range(6):
+    _n = f"{_bpid}-20260101-000000" + (f"-{_k}" if _k else "") + ".json"
+    _fp = os.path.join(_bdir, _n)
+    with open(_fp, "w", encoding="utf-8") as _f:
+        _f.write("{}")
+    os.utime(_fp, (_bt + _k, _bt + _k))   # 越靠后越新
+    _bfiles.append(_n)
+store.prune_backups(_bpid, keep=3)
+_kept = {f for f in os.listdir(_bdir) if f.startswith(_bpid + "-")}
+eq("超额轮转保留最新的 3 份", len(_kept), 3)
+check("保留的是最近三份而非最早三份",
+      _kept == set(_bfiles[-3:]), f"kept={sorted(_kept)}")
+for _n in list(_kept):
+    os.remove(os.path.join(_bdir, _n))
+
 base = ("这是一个用于压测的句子，长度适中。" * 900)  # ~2 万字
 big = base + "损坏片段" * 2
 t0 = time.perf_counter()
@@ -159,6 +180,57 @@ check("页脚字数为两章之和", "25 章" not in win.rail.count.text(), win.
 sd = ui.StatsDialog(win, p)
 check("写作统计窗构造成功", sd is not None)
 check("统计窗有行数=章节数", sd.findChild(ui.QTableWidget).rowCount() == 2 if hasattr(ui, "QTableWidget") else True)
+
+print("\n[2b] 删除章节：当前章不跳、编辑不丢")
+# 三章，正在编辑最后一章；删掉最前面一章后应仍停在原来的章
+p.chapters = [
+    store.Chapter("c1", "第一章", "内容一"),
+    store.Chapter("c2", "第二章", "内容二"),
+    store.Chapter("c3", "第三章", "内容三"),
+]
+p.current = 2
+win.rail.load(p.chapters, 2)
+win.desk.set_chapter(p.chapter)
+win._remove_chapter(0)
+eq("删前置章后仍停在原章", p.current, 1)
+eq("指向的仍是原章节", p.chapter.id, "c3")
+eq("章节数减一", len(p.chapters), 2)
+
+# 编辑器里有未落盘的编辑，删除别的章不能把它弄丢
+p.chapters = [
+    store.Chapter("d1", "第一章", "内容一"),
+    store.Chapter("d2", "第二章", "内容二"),
+    store.Chapter("d3", "第三章", "内容三"),
+]
+p.current = 0
+win.rail.load(p.chapters, 0)
+win.desk.set_chapter(p.chapter)
+win.desk.paper.load_body("改过但还没保存的第一章")
+win._remove_chapter(2)
+eq("当前仍指向第一章", p.chapter.id, "d1")
+check("当前章未落盘的编辑已并回", p.chapter.body == "改过但还没保存的第一章", repr(p.chapter.body))
+
+print("\n[2c] 段落格式：整体替换后块格式必须一致")
+paper0 = win.desk.paper
+paper0.load_body("第一段。\n\n第二段。\n\n第三段。")
+# 模拟 _on_done 里 collapse 改动后走 swap_body 的路径
+paper0.swap_body("第一段。\n\n第二段。\n\n第三段。")
+_blk = paper0.document().begin()
+_fmts = set()
+while _blk.isValid():
+    f = _blk.blockFormat()
+    _fmts.add((f.bottomMargin(), f.lineHeight()))
+    _blk = _blk.next()
+eq("swap_body 后所有段落块格式一致", len(_fmts), 1)
+# replace_tail 同理会清格式，必须补回
+paper0.replace_tail(4, "改过的第三段。")
+_blk = paper0.document().begin()
+_fmts = set()
+while _blk.isValid():
+    f = _blk.blockFormat()
+    _fmts.add((f.bottomMargin(), f.lineHeight()))
+    _blk = _blk.next()
+eq("replace_tail 后所有段落块格式一致", len(_fmts), 1)
 
 print("\n[3] 稿纸改写现场")
 paper = win.desk.paper
@@ -355,6 +427,15 @@ rw = AI.build_rewrite_messages(p, "他走了进来。", "polish", before="", aft
 check("改写上下文的系统提示带禁区",
       AI.STYLE_BAN.strip() in rw[0]["content"])
 
+print("\n[10c] 自动审校：总评解析与重写上下文")
+check("总评「需修改」判定为 fix", AI.review_verdict("【总评】需修改。建议……") == "fix")
+check("总评「合格」判定为 pass", AI.review_verdict("【总评】合格，节奏好。") == "pass")
+check("无总评时判定为 unknown", AI.review_verdict("随手写点啥") == "unknown")
+_fm = AI.build_review_fix_messages(p, "原句。", "【总评】需修改。删套话。")
+check("重写上下文带原文", "原句。" in _fm[1]["content"])
+check("重写上下文带审校意见", "删套话" in _fm[1]["content"])
+check("重写上下文含文风禁区", AI.STYLE_BAN.strip() in _fm[0]["content"])
+
 print("\n[11] 设置面板带上了三个新参数")
 p.settings.temperature = 1.11
 p.settings.presence_penalty = 0.55
@@ -372,6 +453,7 @@ p.settings.theme = "night"
 dlg2 = ui.SettingsDialog(win, p.settings)
 check("保存后配色不丢", dlg2.result_settings().theme == "night")
 p.settings.theme = "blue"
+check("自动审校开关默认开启", dlg2.result_settings().auto_review is True)
 
 print(f"\n{'=' * 46}\n通过 {PASSES} 项，失败 {len(FAILS)} 项")
 for f in FAILS:

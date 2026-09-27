@@ -28,7 +28,7 @@ from PyQt6.QtWidgets import (
     QAbstractItemView, QApplication, QButtonGroup, QDialog, QDoubleSpinBox, QFileDialog,
     QFrame, QGraphicsOpacityEffect, QGridLayout, QHBoxLayout, QHeaderView, QInputDialog,
     QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu, QMessageBox,
-    QPlainTextEdit, QProgressBar, QPushButton, QSizeGrip, QSpinBox,
+    QCheckBox, QPlainTextEdit, QProgressBar, QPushButton, QSizeGrip, QSpinBox,
     QStackedWidget, QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget,
 )
 
@@ -153,6 +153,9 @@ class Manuscript(QTextEdit):
         cur = self.textCursor()
         cur.movePosition(QTextCursor.MoveOperation.End)
         self.setTextCursor(cur)
+        # setPlainText 重建文档会清掉块格式，必须重新施加，否则换章后
+        # 段落间距与其它章不一致。
+        self._apply_rhythm()
         self.ensureCursorVisible()
 
     def append_delta(self, text: str) -> None:
@@ -170,8 +173,31 @@ class Manuscript(QTextEdit):
         self._quiet = False
         self._apply_rhythm()
 
+    def replace_tail(self, n_remove: int, new_text: str) -> None:
+        """把正文末尾 n_remove 个字替换成 new_text（流式期间自动审校用）。
+
+        保持 _quiet=True，避免这次替换被当成用户编辑；流结束由 end_stream 收尾。
+        """
+        full = self.toPlainText()
+        if n_remove > len(full):
+            n_remove = len(full)
+        keep = full[: len(full) - n_remove] if n_remove else full
+        self._quiet = True
+        self.setPlainText(keep + new_text)
+        cur = self.textCursor()
+        cur.movePosition(QTextCursor.MoveOperation.End)
+        self.setTextCursor(cur)
+        # setPlainText 清掉了块格式：不补回来，被重写的这段就没有行距/段距，
+        # 与前面的正文格式对不上（截图里「间距忽大忽小」即由此而来）。
+        self._apply_rhythm()
+        self.ensureCursorVisible()
+
     def body(self) -> str:
         return self.toPlainText()
+
+    def is_quiet(self) -> bool:
+        """载入 / 流式写入期间为真 —— 此时的 textChanged 不代表用户编辑。"""
+        return self._quiet
 
     # ── 就地改写 ──
     def begin_rewrite(self) -> str:
@@ -230,6 +256,7 @@ class Bridge(QObject):
     settings_ready = pyqtSignal(str)
     memory_ready = pyqtSignal(str)
     names_ready = pyqtSignal(str)
+    fix_tail = pyqtSignal(int, str)   # (删除末尾字数, 重写正文)
 
 
 # ══════════════════════════════════════════════════════════
@@ -562,6 +589,7 @@ class Desk(QWidget):
     retitled = pyqtSignal(str)
     stats = pyqtSignal()
     rewrite = pyqtSignal(str)
+    review = pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -660,13 +688,17 @@ class Desk(QWidget):
         a_open = QAction("开篇生成", self)
         a_link = QAction("接龙续写", self)
         a_reformat = QAction("重排段落", self)
+        a_review = QAction("审校本章", self)
+        a_review.setToolTip("检查文风与情节，给出一份审校报告（不改正文）")
         a_open.triggered.connect(self.opening.emit)
         a_link.triggered.connect(self.link.emit)
         a_reformat.triggered.connect(self.reformat.emit)
+        a_review.triggered.connect(self.review.emit)
         m.addAction(a_open)
         m.addAction(a_link)
         m.addSeparator()
         m.addAction(a_reformat)
+        m.addAction(a_review)
         m.addSeparator()
         a_stats = QAction("写作统计", self)
         a_stats.triggered.connect(self.stats.emit)
@@ -1259,7 +1291,7 @@ class ResultDialog(QDialog):
     append_to_brief = pyqtSignal(str)
     closed = pyqtSignal()
 
-    def __init__(self, parent, instruction: str):
+    def __init__(self, parent, instruction: str, use_label: str | None = "并入设定"):
         super().__init__(parent)
         self.setWindowTitle("指令结果")
         self.setModal(False)
@@ -1295,10 +1327,13 @@ class ResultDialog(QDialog):
         self.export_btn.clicked.connect(self._export)
         bar.addWidget(self.export_btn)
 
-        self.use_btn = QPushButton("并入设定")
+        # use_label 为 None 时不提供「并入设定」——审校报告之类的产出不该混进设定
+        self._has_use = use_label is not None
+        self.use_btn = QPushButton(use_label or "")
         self.use_btn.setObjectName("Primary")
         self.use_btn.setEnabled(False)
         self.use_btn.clicked.connect(self._use)
+        self.use_btn.setVisible(self._has_use)
         bar.addWidget(self.use_btn)
 
         close = ghost_button("关闭")
@@ -1314,7 +1349,7 @@ class ResultDialog(QDialog):
     def finish(self) -> None:
         self.note.setText("完成")
         has = bool(self.body.toPlainText().strip())
-        self.use_btn.setEnabled(has)
+        self.use_btn.setEnabled(has and self._has_use)
         self.export_btn.setEnabled(has)
 
     def fail(self, msg: str) -> None:
@@ -1660,6 +1695,11 @@ class SettingsDialog(QDialog):
         self.tchars.setValue(s.target_chars)
         add("默认生成字数", self.tchars)
 
+        self.autorev = QCheckBox("一键生成时自动审校，不合格按意见重写")
+        self.autorev.setChecked(bool(getattr(s, "auto_review", True)))
+        g.addWidget(self.autorev, r, 0, 1, 2)
+        r += 1
+
         self.font = QSpinBox()
         self.font.setRange(12, 28)
         self.font.setSingleStep(1)
@@ -1698,6 +1738,7 @@ class SettingsDialog(QDialog):
                 "base_url", "api_key", "model", "temperature", "max_tokens",
                 "context_budget", "corpus_budget", "target_chars", "chapter_max",
                 "editor_size", "top_p", "presence_penalty", "frequency_penalty",
+                "auto_review",
             }
         }
         return Settings(
@@ -1715,6 +1756,7 @@ class SettingsDialog(QDialog):
             target_chars=int(self.tchars.value()),
             chapter_max=int(self.chmax.value()),
             editor_size=int(self.font.value()),
+            auto_review=bool(self.autorev.isChecked()),
         )
 
 
@@ -1754,6 +1796,7 @@ class Window(QWidget):
         self.bridge.settings_ready.connect(self._on_settings_ready)
         self.bridge.memory_ready.connect(self._on_memory_ready)
         self.bridge.names_ready.connect(self._on_names_ready)
+        self.bridge.fix_tail.connect(self._on_fix_tail)
 
         self._stop = threading.Event()
         self._handle: AI.StreamHandle | None = None
@@ -1766,6 +1809,11 @@ class Window(QWidget):
         self._stats: StatsDialog | None = None
         self._rewrite_wrote = False
         self._rewrite_label = ""
+        self._renewed_memory = False   # 本次续写是否压缩过记忆（需回填右栏）
+        self._bg_memory = False        # 后台线程是否正在写 memory
+        self._fade_effect = None       # 切章淡入：效果与动画各建一次复用
+        self._fade_anim = None
+        self._tail_done = threading.Event()   # 自动审校：等待主线程替换稿纸尾部
 
         # 一键生成状态
         self._gen_active = False
@@ -1810,6 +1858,7 @@ class Window(QWidget):
         self.desk.write.connect(self._start_write)
         self.desk.link.connect(self._start_link)
         self.desk.reformat.connect(self._start_reformat)
+        self.desk.review.connect(self._start_review)
         self.desk.generate.connect(self._start_generate)
         self.desk.opening.connect(self._start_opening)
         self.desk.stats.connect(self._open_stats)
@@ -1899,8 +1948,11 @@ class Window(QWidget):
         p = self.project
         p.chapter.title = self.desk.title.text().strip() or "未命名"
         p.chapter.body = self.desk.paper.body()
-        p.memory = self.inspector.memory.toPlainText()
         p.premise = self.inspector.premise.toPlainText()
+        # memory 可能正被后台线程改写（压缩前情 / 整理整章）。此时若用右栏
+        # 的旧文本盖回去，后台累积的摘要会丢失 —— 跳过，等后台结果回填。
+        if not self._bg_memory and not self._busy:
+            p.memory = self.inspector.memory.toPlainText()
         try:
             with self._plock:
                 p.save()
@@ -1937,19 +1989,20 @@ class Window(QWidget):
     def _crossfade(self) -> None:
         """切换章节时的交叉淡入：内容换了，空间没有断裂。
 
-        动画对象不能用 DeleteWhenStopped —— 它会在结束时删掉 C++ 对象，
-        而 finished 里的槽还握着它的引用，再碰一次就是野指针。这里让它
-        被主窗口收着（parent=self），自然活到下次重用。
+        效果与动画各建一次、反复复用 —— 原先每次切章都新建一对，动画以
+        self 为父不会被回收，长会话里频繁翻章会持续累积 QObject。
+        动画结束不摘掉 effect（常驻、opacity 归 1 无副作用），下次直接重跑。
         """
-        eff = QGraphicsOpacityEffect(self.desk.paper)
-        self.desk.paper.setGraphicsEffect(eff)
-        anim = QPropertyAnimation(eff, b"opacity", self)
-        anim.setDuration(200)
-        anim.setStartValue(0.25)
-        anim.setEndValue(1.0)
-        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-        anim.finished.connect(lambda: self.desk.paper.setGraphicsEffect(None))
-        anim.start()
+        if self._fade_effect is None:
+            self._fade_effect = QGraphicsOpacityEffect(self.desk.paper)
+            self.desk.paper.setGraphicsEffect(self._fade_effect)
+            self._fade_anim = QPropertyAnimation(self._fade_effect, b"opacity", self)
+            self._fade_anim.setDuration(200)
+            self._fade_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._fade_anim.stop()
+        self._fade_anim.setStartValue(0.25)
+        self._fade_anim.setEndValue(1.0)
+        self._fade_anim.start()
 
     def _add_chapter(self) -> None:
         self._stash()
@@ -1979,8 +2032,21 @@ class Window(QWidget):
         if len(p.chapters) <= 1:
             self.desk.set_status("至少要保留一章")
             return
+        if not (0 <= row < len(p.chapters)):
+            return
+        # 先把编辑中的内容并回 project —— 否则 set_chapter 会用旧数据盖掉
+        # 当前章尚未落盘的编辑，等于丢稿。
+        self._stash()
+        cur = p.current
         del p.chapters[row]
-        p.current = max(0, min(row, len(p.chapters) - 1))
+        # 删的是当前章 → 落到同位置；删的是它前面的章 → 索引前移一位。
+        if cur == row:
+            p.current = min(row, len(p.chapters) - 1)
+        elif cur > row:
+            p.current = cur - 1
+        else:
+            p.current = cur
+        p.current = max(0, min(p.current, len(p.chapters) - 1))
         self.rail.load(p.chapters, p.current)
         self.desk.set_chapter(p.chapter)
         self.desk.refresh_meta(p)
@@ -2070,6 +2136,10 @@ class Window(QWidget):
         )
 
     def _on_text(self) -> None:
+        # 载入正文、流式回填都会触发 textChanged，但它们不是用户编辑 ——
+        # 若在此标脏，程序一启动 8 秒后就会白存一次盘。
+        if self.desk.paper.is_quiet():
+            return
         self._dirty = True
         self.desk.refresh_meta(self.project)
         self._meta_timer.start()
@@ -2603,6 +2673,7 @@ class Window(QWidget):
                 with self._plock:
                     AI.renew_memory(p, on_step=lambda t: self.bridge.status.emit(t))
                 snapshot[:] = AI.build_messages(p, tail=p.chapter.body)
+                self._renewed_memory = True
                 self.bridge.status.emit("记忆已更新，继续续写…")
 
             self.bridge.status.emit("正在续写…")
@@ -2614,6 +2685,7 @@ class Window(QWidget):
                     f"接口限流，第 {n} 次重试（{w:.0f}s 后）…"
                 ),
                 on_round=lambda n: self._mark_round(n),
+                on_round_text=self._round_review,
             ):
                 if first:
                     self.bridge.status.emit("")
@@ -2622,6 +2694,42 @@ class Window(QWidget):
             self.bridge.done.emit()
 
         self._worker(work)
+
+    def _on_fix_tail(self, n_remove: int, new_text: str) -> None:
+        """主线程：自动审校判定需改，把稿纸末尾 n_remove 个字换成重写正文。
+
+        先把缓冲里还没写进稿纸的增量 flush 掉 —— 否则稿纸末尾比本轮产出短，
+        按字数删尾会删错位置。
+        """
+        self._flush_delta()
+        self.desk.paper.replace_tail(n_remove, new_text)
+        self._tail_done.set()
+
+    def _round_review(self, round_text: str) -> "str | None":
+        """一键生成时，每写完一轮自动审校；不合格按意见重写。
+
+        在后台线程被 stream_completion 回调，会阻塞到主线程完成尾部替换。
+        审校出任何错都不该打断写作，故整段包进 try。
+        """
+        if not getattr(self.project.settings, "auto_review", False):
+            return None
+        if not self._gen_active or len(round_text.strip()) < 60:
+            return None
+        try:
+            fixed, _report = AI.review_and_fix(
+                self.project, round_text,
+                on_step=lambda t: self.bridge.status.emit(t),
+            )
+        except Exception:  # noqa: BLE001
+            return None
+        if fixed.strip() == round_text.strip():
+            self.bridge.status.emit("本段审校通过")
+            return None
+        self._tail_done.clear()
+        self.bridge.fix_tail.emit(len(round_text), fixed)
+        self._tail_done.wait(timeout=15)
+        self.bridge.status.emit("本段审校未过，已按意见重写")
+        return fixed
 
     def _start_rewrite(self, mode: str) -> None:
         """就地改写选中的一段：润色 / 扩写 / 缩写 / 重写。
@@ -2674,7 +2782,7 @@ class Window(QWidget):
 
     # ── 流式回调 ──
     def _on_delta(self, piece: str) -> None:
-        if self._stream_target in ("dialog", "reformat"):
+        if self._stream_target in ("dialog", "reformat", "review"):
             if self._result is not None:
                 self._result.append(piece)
             return
@@ -2760,7 +2868,7 @@ class Window(QWidget):
             self._save()
             return
 
-        if self._stream_target in ("dialog", "reformat"):
+        if self._stream_target in ("dialog", "reformat", "review"):
             if self._result is not None:
                 self._result.finish()
             self.desk.set_status("指令完成")
@@ -2778,6 +2886,11 @@ class Window(QWidget):
         else:
             self.desk.set_status("已写入")
         self._gen_active = False
+        # 续写途中压缩过记忆：把后台写入的新记忆回填右栏，
+        # 否则紧接着的 _save 会拿右栏旧文本把它盖掉。
+        if self._renewed_memory:
+            self._renewed_memory = False
+            self.inspector.memory.setPlainText(self.project.memory)
         self._dirty = True
         self._save()
         self._flush_summaries()
@@ -2802,6 +2915,7 @@ class Window(QWidget):
 
         def work() -> None:
             done = 0
+            self._bg_memory = True   # 期间禁止 autosave 用界面旧值盖 memory
             try:
                 for body in pending:
                     # 与主线程 autosave 争同一个 Project，必须排它
@@ -2813,6 +2927,8 @@ class Window(QWidget):
                 self._pending_summaries[:] = pending[done:]
                 self.bridge.status.emit(f"记忆整理中断（已完成 {done} 章）：{e}")
                 return
+            finally:
+                self._bg_memory = False
             self._pending_summaries[:] = []
             self.bridge.memory_ready.emit(p.memory)
 
@@ -2869,12 +2985,17 @@ class Window(QWidget):
             self.desk.set_status("未改动作品名")
 
     def _on_settings_ready(self, text: str) -> None:
-        """补全 / 分析的产出 —— 直接并入「设定」。"""
+        """补全 / 分析的产出 —— 整体替换「设定」。
+
+        不再追加：补全设定与全面分析产出的都是完整设定，旧内容已被吸收进
+        结果里（分析也会读到作者的设定方向）。若在旧文本后再叠一坨，点几次
+        就积出好几份互相打架的设定，续写时被整段当作「最高优先级」灌给
+        模型，剧情自然前后矛盾、看不懂。
+        """
         auto = self._auto_analyzing
         self._auto_analyzing = False
+        merged = text.strip()
         box = self.inspector.premise
-        cur = box.toPlainText().strip()
-        merged = (cur + "\n\n---\n\n" + text.strip()) if cur else text.strip()
         box.setPlainText(merged)
         self.project.premise = merged
         self._busy = False
@@ -2889,7 +3010,7 @@ class Window(QWidget):
         self._gen_active = False
         self.desk.set_busy(False)
 
-        if self._stream_target in ("dialog", "reformat"):
+        if self._stream_target in ("dialog", "reformat", "review"):
             if self._result is not None:
                 self._result.fail(msg)
             self.desk.set_status(msg)
@@ -2906,6 +3027,8 @@ class Window(QWidget):
                 note = f"{self._rewrite_label}失败：{msg}（原文未改动）"
             self.project.chapter.body = self.desk.paper.body()
             self.desk.refresh_meta(self.project)
+            self._dirty = True
+            self._save()
             self.desk.set_status(note)
             return
 
@@ -2949,6 +3072,37 @@ class Window(QWidget):
 
         def work() -> None:
             out = AI.reformat_chapter(p, on_step=lambda t: self.bridge.status.emit(t))
+            self.bridge.delta.emit(out)
+            self.bridge.done.emit()
+
+        self._worker(work)
+
+    def _start_review(self) -> None:
+        """审校本章：检查文风与情节，产出报告（不改正文）。
+
+        生成器—审校器分离：续写用提示词约束「怎么写」，但模型不一定遵守；
+        这里用一次独立调用回头验收，问题逐条列出，改不改由作者决定。
+        """
+        if self._busy or not self._guard_key():
+            return
+        self._stash()
+        p = self.project
+        if len(p.chapter.body.strip()) < 50:
+            self.desk.set_status("正文太短，无需审校")
+            return
+        self._busy = True
+        self.desk.set_busy(True)
+        self.desk.set_status("正在审校正文…")
+        self._stream_target = "review"
+
+        # 报告不并入设定，因此不给「并入设定」按钮
+        self._result = ResultDialog(self, "审校报告 —— 文风与情节", use_label=None)
+        self._result.closed.connect(self._forget_result)
+        self._result.show()
+
+        def work() -> None:
+            out = AI.review_chapter(p, p.chapter.body,
+                                    on_step=lambda t: self.bridge.status.emit(t))
             self.bridge.delta.emit(out)
             self.bridge.done.emit()
 

@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 import urllib.error
@@ -86,22 +87,32 @@ PARAS_MIN, PARAS_MAX = 4, 8
 
 
 # ── 补全设定：把作者给的大纲扩写成完整设定 ──────────────
-EXPAND_PROMPT = """你是一位小说设定顾问。作者给了一段粗略的故事方向，请把它补全成一份完整、可直接用于写作的作品设定。
+# 分小节生成：一次只让模型写一节。小模型在长输出时会退化复读，拆成
+# 六次短请求能显著降低概率，还能让后续小节读到前面已定的名字、保持一致。
+EXPAND_SECTIONS: list[tuple[str, str]] = [
+    ("题材与基调", "类型、风格；用一句话说清核心冲突——主角想要什么、被什么挡住。"),
+    ("人物", "主角与主要配角：姓名、身份、性格、彼此关系、各自的目标与秘密。至少 3 个有名有姓的人物。"),
+    ("世界观", "时代、地点、规则设定。若含修炼 / 等级体系，从低到高把每一级列全，给出名称与大致实力刻度。"),
+    ("势力与地名", "至少 4 个门派 / 组织 / 关键场景：名称、定位、与主角的关系。"),
+    ("专有名词", "重要功法、器物、称号等：名称 + 具体作用。"),
+    ("笔法", "建议的人称、时态、句法密度、对话习惯。"),
+]
 
-按以下小节输出，用【】标注小标题，没有把握的小节可略去：
+# 每次请求的系统提示：只写一节，且必须与已定的设定一致。
+EXPAND_PROMPT = """你是一位小说设定顾问，负责把作者给的粗略方向补全成可用于写作的作品设定。
 
-【题材与基调】类型、风格、核心冲突。
-【人物】主角与主要配角：姓名、身份、性格、彼此关系。
-【世界观】时代、地点、规则设定（如修炼体系、境界划分，需从低到高列全）。
-【势力与地名】门派、组织、主要场景的名称与定位。
-【专有名词】重要功法、器物、称号等，及其含义。
-【笔法】建议的人称、时态、句法密度、对话习惯。
+你每次只写一个小节，用【】标注该小节标题。
 
 硬性要求：
-1. 直接输出设定，不要寒暄，不要复述要求，不要写小说正文。
+1. 直接输出该小节内容，不要寒暄、不要复述要求、不要写小说正文、不要写其它小节。
 2. 与作者给定方向一致；未提及处可合理补全，但不得与之矛盾。
-3. 命名、数值、层级必须具体、内部自洽，避免空泛形容。
-4. 使用中文全角标点。"""
+3. 若给出了「已确定的设定」，其中的人名、地名、境界、数值必须与之完全一致，
+   不得改动，也不得另起第二种叫法。
+4. 命名、数值、层级必须具体且内部自洽。
+5. 禁止空泛形容：不写「实力强大」「神秘莫测」这类词，
+   要写清它强在哪、是什么、有什么具体表现或数值。
+6. 命名风格统一，使用中文全角标点。
+7. 控制篇幅：一个小节通常 150-400 字，写清要点即可，不要堆砌名词。"""
 
 
 class AIError(RuntimeError):
@@ -419,6 +430,29 @@ def collapse_blocks(text: str, min_dup_len: int = 12, window: int = 6) -> str:
     return "\n\n".join(paras)
 
 
+def degenerate_reason(text: str) -> str:
+    """检测模型「复读退化」：返回原因字符串，正常则返回空串。
+
+    小模型在长输出时会词穷，退化成一长串无标点的名词轰炸或重复片段
+    （实测某次补全从「化神境」起无限堆词到 "ronnmetres ronnmetres"）。
+    这种输出 token 没超、finish_reason 还是 stop，截断检测拦不住，
+    必须靠内容特征识别。
+    """
+    t = text.strip()
+    if len(t) < 200:
+        return ""
+    # 特征一：正常中文写作不会出现超长无标点片段
+    runs = re.split(r"[，。！？；：、,.!?;:\n]", t)
+    longest = max((len(x) for x in runs), default=0)
+    if longest >= 100:
+        return f"出现连续 {longest} 字无标点，疑似复读退化"
+    # 特征二：清理重复后大幅缩水
+    cleaned = collapse_blocks(collapse_repeats(t))
+    if len(cleaned) < len(t) * 0.7:
+        return f"重复内容过多（{len(t)} 字清理后仅剩 {len(cleaned)} 字）"
+    return ""
+
+
 def stream_completion(
     s: Settings,
     messages: list[dict],
@@ -427,6 +461,7 @@ def stream_completion(
     target_chars: int = 0,
     on_retry: Callable[[int, float], None] | None = None,
     on_round: Callable[[int], None] | None = None,
+    on_round_text: Callable[[str], "str | None"] | None = None,
 ) -> Iterator[str]:
     """逐段产出正文增量，被截断时自动接续，直到自然收尾或写满目标。
 
@@ -542,6 +577,12 @@ def stream_completion(
             buf = ""
 
         round_text = "".join(round_out)
+        # 每轮结束的回钩：可用于自动审校 —— 若返回重写后的文本，
+        # 以它替换本轮产出（界面已同步做过尾部替换，见 ui._round_review）。
+        if on_round_text and round_text:
+            fixed = on_round_text(round_text)
+            if fixed is not None:
+                round_text = fixed
         emitted += round_text
 
         # 定量模式：只要没达标就续写，不管 finish_reason
@@ -577,7 +618,8 @@ def stream_completion(
 TEMP_TASK = 0.3      # 压缩记忆 / 章节摘要：求准
 TEMP_STRICT = 0.1    # 重排段落：一个字都不许改
 TEMP_ANALYSIS = 0.4  # 通读分析：要稳，但允许一点归纳
-TEMP_IDEA = 0.8      # 补全设定 / 拟书名：要发散
+TEMP_SETTING = 0.5   # 补全设定：命名可以发散，但人物/境界/数值必须自洽
+TEMP_IDEA = 0.8      # 拟书名：纯发散
 
 
 def complete(
@@ -586,11 +628,16 @@ def complete(
     max_tokens: int = 700,
     on_retry: Callable[[int, float], None] | None = None,
     temperature: float | None = None,
+    strict: bool = False,
 ) -> str:
-    """一次性调用（用于记忆摘要）。
+    """一次性调用（用于记忆摘要、设定补全等）。
 
     temperature 为 None 时用 TEMP_TASK —— 这类任务求准，不该跟着续写的
     0.92 一起飘；确实想要发散的调用方（拟书名等）自己传高温。
+
+    strict=True 时，若输出被 max_tokens 硬截断（finish_reason == "length"）
+    就抛 AIError。默认 False 是因为摘要这类短任务截断了也无伤大雅；但设定
+    补全这种要求完整的长任务必须 strict —— 否则半截结果会被当成完整设定。
     """
     temp = TEMP_TASK if temperature is None else temperature
     for attempt in range(MAX_RETRIES + 1):
@@ -612,7 +659,14 @@ def complete(
         choices = obj.get("choices") or []
         if not choices:
             raise AIError("模型没有返回任何内容")
-        return (choices[0].get("message") or {}).get("content", "").strip()
+        choice0 = choices[0]
+        text = (choice0.get("message") or {}).get("content", "").strip()
+        if strict and choice0.get("finish_reason") == "length":
+            raise AIError(
+                f"输出被单次上限（{max_tokens} tokens）截断，结果不完整。"
+                "请在「引擎设置 → 单次上限」调大后重试。"
+            )
+        return text
     raise AIError("请求失败")
 
 
@@ -631,22 +685,55 @@ ANALYSIS_PROMPT = """你是小说编辑，负责从已有材料里提炼出供�
 
 
 def expand_settings(p: Project, on_step: Callable[[str], None] | None = None) -> str:
-    """把作者给的粗略方向，补全成完整的作品设定。"""
-    s = p.settings
-    if on_step:
-        on_step("正在补全设定…")
+    """把作者给的粗略方向，补全成完整的作品设定。
 
-    parts: list[str] = []
-    if p.premise.strip():
-        parts.append("【作者给出的方向】\n" + p.premise.strip())
-    if not parts:
+    分六次请求，每次只写一节 —— 一次让模型吐满六节，小模型会在后半程
+    退化复读（实测从「化神境」起堆词到 "ronnmetres"）。拆短 + 每节做完
+    退化检测，既降低退化概率，也保证退化时明确报错而非默默存下垃圾。
+    """
+    s = p.settings
+    direction = p.premise.strip()
+    if not direction:
         raise AIError("先写几句故事方向，我才有依据补全。")
 
-    messages = [
-        {"role": "system", "content": EXPAND_PROMPT},
-        {"role": "user", "content": "\n\n".join(parts)},
-    ]
-    return complete(s, messages, max_tokens=2000, temperature=TEMP_IDEA)
+    out: list[str] = []
+    n = len(EXPAND_SECTIONS)
+    for i, (title, req) in enumerate(EXPAND_SECTIONS, 1):
+        if on_step:
+            on_step(f"正在补全设定（{i}/{n}）：{title}…")
+        parts = ["【作者给出的方向】\n" + direction]
+        if out:
+            parts.append(
+                "【已确定的设定（人名、地名、境界、数值必须与之一致）】\n"
+                + "\n\n".join(out)
+            )
+        parts.append(
+            f"本次只写【{title}】这一节：{req}\n"
+            f"直接输出【{title}】及其内容，不要写其它小节，不要复述要求。"
+        )
+        messages = [
+            {"role": "system", "content": EXPAND_PROMPT},
+            {"role": "user", "content": "\n\n".join(parts)},
+        ]
+        text = complete(
+            s, messages,
+            max_tokens=2000,
+            temperature=TEMP_SETTING,
+            strict=True,
+        ).strip()
+        why = degenerate_reason(text)
+        if why:
+            raise AIError(
+                f"补全「{title}」时模型输出异常：{why}。"
+                "请重试；若反复出现，说明该模型长输出不稳定，建议换用更强的模型。"
+            )
+        if not text.startswith("【"):
+            text = f"【{title}】\n{text}"
+        out.append(text)
+
+    if on_step:
+        on_step("设定补全完成")
+    return "\n\n".join(out)
 
 
 def analyze_corpus(p: Project, on_step: Callable[[str], None] | None = None) -> str:
@@ -656,6 +743,10 @@ def analyze_corpus(p: Project, on_step: Callable[[str], None] | None = None) -> 
         on_step("正在通读材料…")
 
     parts: list[str] = []
+    # 作者手写的方向也是「材料」，必须一并交给模型 —— 否则分析产出会把它
+    # 整体覆盖掉，用户写的大方向就此丢失。
+    if p.premise.strip():
+        parts.append("【作者设定方向（须遵守）】\n" + p.premise.strip())
     digest = corpus_digest(p.corpus, s.corpus_budget)
     if digest:
         parts.append("【参考语料】\n" + digest)
@@ -823,24 +914,32 @@ def build_messages(
 # ── 开篇模式：给设定，让模型自己起名开篇 ──────────────
 OPENING_PROMPT = f"""你是一位职业小说家，正在为一部新长篇撰写开篇。
 
-根据给定的【作品设定】写出第一章的开头。
+根据给定的【作品设定】写出第一章的开头。这是全书的第一段文字，读者对
+这个世界、这个人一无所知 —— 你的首要任务是：在抛悬念之前，先让读者看懂
+眼前正在发生什么，以及这事是怎么走到这一步的。
 
 开头必须做到：
-1. 第一句就落到一个具体场景：谁、在哪里、正在做什么。
-   禁止用天气、回忆、概述、旁白或「多年以后」式的交代开场。
-2. 主角在前三句内出场，并立刻处在一个具体的处境里。
+1. 第一段就落到一个具体场景：谁、在哪里、正在做什么、正面对什么麻烦。
+   不要用天气或纯旁白空转，但也不要把背景完全藏起来 —— 该交代的交代清楚。
+2. 主角在前三句内出场并进入处境。开头 300 字之内，读者必须能明白三件事：
+   主角是谁（身份与处境）、这是什么世界、眼下这段麻烦会把他推向哪里。
 3. 埋一个钩子 —— 一个反常的细节、一句没头没尾的话、一件正在逼近的麻烦，
-   让读者想往下读，但不要解释它。
-4. 世界设定通过动作与对话自然带出，不要成段介绍背景、境界、势力。
+   让读者想往下读。钩子可以悬着不解释，但主角眼下的处境必须说清楚。
+4. 设定中点名的核心要素（如系统、金手指、关键身份、核心冲突）必须在开篇
+   出现或被明确暗示，不许只当背景板。比如设定写了「系统」，开头就该见到它。
+5. 场景之间必须承接：段与段、动作与动作之间用一两句过渡连起来，让读者看得
+   出事情一步步是怎么发生的，不要把开头写成互不相连的画面切片。
 
 硬性要求：
 1. 直接输出正文，不要任何解释、标题、序号或 Markdown 标记。
-2. 设定只给大致方向时，人物姓名、地名、门派、专有名词由你补全，
-   取得自然、好听、内部自洽。
-3. 段落必须短。每个自然段只写 1 到 3 句，通常不超过 80 字。
-   对话必须独立成段，不得与叙述混在同一段里。
-4. 使用中文全角标点，对话使用中文引号。
-5. 只写这一章的开头，在一个完整的句子处收住，不要总结、不要升华。{STYLE_BAN}"""
+2. 设定只给大致方向时，人物姓名、地名、门派、专有名词由你补全，取得自然、
+   好听、内部自洽；但若设定已给出名字，必须沿用。
+3. 段落以叙事节奏为准，一般 2 到 4 句成一段。对话仍独立成段。
+   不要为了短而把每句话都拆成单独一段 —— 那读起来像提纲，不像小说。
+4. 禁止这些被写烂的开场套路：主角跪在祠堂挨训、家族惨遭灭门、废柴被退婚、
+   夺宝当场遭围杀。要给读者一个新鲜的切入角度。
+5. 使用中文全角标点，对话使用中文引号。
+6. 只写这一章的开头，在一个完整的句子处收住，不要总结、不要升华。{STYLE_BAN}"""
 
 
 REFORMAT_PROMPT = """你是文本排版编辑。下面给你一段小说正文。
@@ -985,6 +1084,32 @@ REWRITE_PROMPT = f"""你是一位职业小说家，正在修改自己稿子里�
 6. 使用中文全角标点，对话使用中文引号。{STYLE_BAN}"""
 
 
+# ── 审校报告：生成器—审校器分离 ─────────────────────────
+# 续写提示词只管「怎么写」，不负责验收；这里用一次独立调用回头检查产出，
+# 把模型自己看不见的问题（违反文风禁区、情节没推进）挑出来，交给作者定夺。
+REVIEW_PROMPT = f"""你是一位严格的小说编辑，负责审校一段刚写完的正文。
+
+只做两件事，不要改写正文，也不要泛泛夸奖：
+
+一、文风审查。逐条对照下面的文风禁区，指出违反之处。每条都要引用原文里的
+问题句（可只引半句），并说明它违反了哪一条。没有违反就写「无」。
+{STYLE_BAN}
+
+二、情节审查。回答：这一段有没有「事发生」——有人想要某样东西、撞上阻碍、
+做出反应，局面随之改变？若只是写景、回忆、心理独白或概述而没有推进，
+指出是哪几句在凑字数。
+
+输出格式（用【】标注，不要用 Markdown 代码块）：
+【文风】逐条列出问题，或「无」
+【情节】一句话结论，并引用问题句
+【总评】合格 或 需修改，并给出一句最关键的修改建议。
+
+要求：
+1. 只针对给出的正文，不要臆造原文没有的内容。
+2. 引用问题句时保持原样，不要改写。
+3. 若正文确实写得好，就直说合格，不要为凑数硬找问题。"""
+
+
 def build_rewrite_messages(
     p: Project,
     selection: str,
@@ -1015,6 +1140,91 @@ def build_rewrite_messages(
         {"role": "system", "content": REWRITE_PROMPT},
         {"role": "user", "content": "\n\n".join(blocks)},
     ]
+
+
+def review_chapter(p: Project, body: str, on_step: Callable[[str], None] | None = None) -> str:
+    """审校一段正文：文风是否违反禁区 + 情节是否推进。
+
+    生成器—审校器分离：续写用的提示词只管「怎么写」，不负责验收；
+    这里用一次独立调用回头检查产出。带上作品设定作为比对参照，
+    正文若与设定有明显矛盾（人名、境界）也会一并指出。
+    """
+    s = p.settings
+    body = body.strip()
+    if len(body) < 50:
+        raise AIError("正文太短，无需审校。")
+    if on_step:
+        on_step("正在审校正文…")
+
+    parts: list[str] = []
+    if p.premise.strip():
+        parts.append(
+            "【作品设定（供比对，若正文与之矛盾请一并指出）】\n"
+            + p.premise.strip()[:2000]
+        )
+    parts.append("【待审校的正文】\n" + body)
+
+    messages = [
+        {"role": "system", "content": REVIEW_PROMPT},
+        {"role": "user", "content": "\n\n".join(parts)},
+    ]
+    return complete(s, messages, max_tokens=2000, temperature=TEMP_ANALYSIS)
+
+
+def review_verdict(report: str) -> str:
+    """从审校报告里读【总评】，返回 "pass" / "fix" / "unknown"。"""
+    m = re.search(r"【总评】\s*([^\n]*)", report or "")
+    line = m.group(1) if m else (report or "")
+    if "需修改" in line or "不合格" in line:
+        return "fix"
+    if "合格" in line:
+        return "pass"
+    return "unknown"
+
+
+def build_review_fix_messages(p: Project, body: str, report: str) -> list[dict]:
+    """按审校意见重写一段正文。"""
+    blocks: list[str] = []
+    if p.premise.strip():
+        blocks.append("【作品设定】（最高优先级，须严格遵守）\n" + p.premise.strip()[:1200])
+    blocks.append("【待修改的正文】\n" + body.strip())
+    blocks.append("【编辑的审校意见】\n" + report.strip())
+    blocks.append(
+        "请按审校意见重写上面这段正文：保留原有情节、信息与大致篇幅，"
+        "只修正被指出的问题（套话、比喻堆砌、没有推进等）。"
+        "直接输出重写后的正文，不要解释、不要复述意见。"
+    )
+    return [
+        {"role": "system", "content": REWRITE_PROMPT},
+        {"role": "user", "content": "\n\n".join(blocks)},
+    ]
+
+
+def review_and_fix(
+    p: Project,
+    body: str,
+    max_fix_rounds: int = 2,
+    on_step: Callable[[str], None] | None = None,
+) -> tuple[str, str]:
+    """审校一段正文，不合格就按意见重写，最多重写 max_fix_rounds 轮。
+
+    返回 (最终正文, 最终审校报告)。用于一键生成的「每轮自动审校」——
+    早发现早重写，避免写歪一大段才发现。
+    """
+    report = review_chapter(p, body, on_step)
+    fixed = 0
+    while review_verdict(report) == "fix" and fixed < max_fix_rounds:
+        fixed += 1
+        if on_step:
+            on_step(f"审校未过，正按意见重写（第 {fixed}/{max_fix_rounds} 次）…")
+        msgs = build_review_fix_messages(p, body, report)
+        body = complete(
+            p.settings, msgs,
+            max_tokens=max(2000, p.settings.max_tokens),
+            temperature=p.settings.temperature,
+        )
+        report = review_chapter(p, body, on_step)
+    return body, report
 
 
 def context_usage(p: Project) -> float:

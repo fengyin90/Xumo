@@ -65,15 +65,26 @@ def snapshot(pid: str) -> str:
 
 
 def prune_backups(pid: str, keep: int = BACKUP_KEEP) -> None:
-    """按名倒序保留最近 keep 份快照。"""
+    """保留最近 keep 份快照（按修改时间，新的在前）。
+
+    不能按文件名倒序 —— 同一秒内的快照会带 -1、-2 后缀，字符串比较里
+    「.」(46) > 「-」(45)，无后缀的那份会排在带后缀的之后，于是轮转时
+    删新留旧。按 mtime 排序才是「最近」的真意。
+    """
     folder = backup_dir()
     if not os.path.isdir(folder):
         return
-    olds = sorted(
-        (f for f in os.listdir(folder) if f.startswith(pid + "-")),
-        reverse=True,
-    )
-    for old in olds[keep:]:
+    entries: list[tuple[float, str]] = []
+    for name in os.listdir(folder):
+        if not name.startswith(pid + "-"):
+            continue
+        try:
+            mtime = os.stat(os.path.join(folder, name)).st_mtime
+        except OSError:
+            continue
+        entries.append((mtime, name))
+    entries.sort(reverse=True)
+    for _mtime, old in entries[keep:]:
         try:
             os.remove(os.path.join(folder, old))
         except OSError:
@@ -166,6 +177,8 @@ class Settings:
     target_chars: int = 2000
     # 单章字数上限；超出后自动开启新章继续。0 表示不限
     chapter_max: int = 5000
+    # 一键生成时，每写完一轮自动审校，不合格就按意见重写
+    auto_review: bool = True
     theme: str = "blue"
     # 编辑区正文字号（px）
     editor_size: int = 16
@@ -325,7 +338,7 @@ def delete_project(pid: str) -> None:
     folder = backup_dir()
     if os.path.isdir(folder):
         for name in os.listdir(folder):
-            if name.startswith(pid):
+            if name.startswith(pid + "-"):
                 try:
                     os.remove(os.path.join(folder, name))
                 except OSError:

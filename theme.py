@@ -191,6 +191,11 @@ RAIL_W     = 232   # 左：章节栏
 INSPECT_W  = 300   # 右：语料与上下文
 TITLEBAR_H = 54    # 计入首屏预算
 
+# 圆角与栏内边距：一处定义、各栏引用，杜绝 14 / 16 之类的硬编码散落
+SIDE_PAD  = 16     # 左右栏内容的水平内边距
+RADIUS    = 4      # 输入框 / 按钮圆角
+RADIUS_LG = 6      # 浮层（菜单 / 提示 / 弹窗）圆角
+
 # 内容列最大宽度：视口是海报，不是文档——长行会杀死阅读
 MEASURE = 680
 
@@ -217,6 +222,10 @@ def build_qss(editor_size: int | None = None) -> str:
 }}
 
 QWidget#Canvas {{ background: {canvas}; }}
+QWidget#GlowBorder {{ background: transparent; }}
+QScrollArea#PresetScroll {{ background: transparent; border: none; }}
+QScrollArea#PresetScroll > QWidget > QWidget {{ background: transparent; }}
+QDialog {{ background: {p["input_bg"]}; }}
 QDialog#Reader {{ background: {desk}; }}
 QWidget#Rail {{ background: {rail}; }}
 QWidget#Inspector {{ background: {inspect}; }}
@@ -298,21 +307,20 @@ QTextEdit#Manuscript[busy="true"] {{ color: {p["busy_text"]}; }}
 QLineEdit, QPlainTextEdit {{
     background: {p["input_bg"]};
     border: 1px solid {p["rule"]};
-    border-radius: 2px;
+    border-radius: {RADIUS}px;
     padding: 6px 9px;
     font-size: 12px;
     color: {p["text"]};
 }}
-QLineEdit:focus, QPlainTextEdit:focus {{
-    border: 1px solid {p["accent_dim"]};
-}}
+QLineEdit:hover, QPlainTextEdit:hover {{ border-color: {p["text_faint"]}; }}
+QLineEdit:focus, QPlainTextEdit:focus {{ border: 1px solid {p["accent"]}; }}
 
 /* 批注栏：极淡底色让侧栏渐变透上来，区块感来自 2% 的亮度差，而非色块 */
 QPlainTextEdit#Notes {{
     background: {p["scrim"]};
     border: 1px solid {p["rule_soft"]};
     border-left: 1px solid {p["accent_dim"]};
-    border-radius: 0;
+    border-radius: {RADIUS}px;
     padding: 8px 10px;
     font-size: 12px;
     line-height: 165%;
@@ -330,12 +338,13 @@ QLineEdit::placeholder {{ color: {p["text_faint"]}; }}
 QSpinBox, QDoubleSpinBox {{
     background: {p["input_bg"]};
     border: 1px solid {p["rule"]};
-    border-radius: 2px;
+    border-radius: {RADIUS}px;
     padding: 6px 22px 6px 9px;
     font-size: 12px;
     color: {p["text"]};
 }}
-QSpinBox:focus, QDoubleSpinBox:focus {{ border: 1px solid {p["accent_dim"]}; }}
+QSpinBox:hover, QDoubleSpinBox:hover {{ border-color: {p["text_faint"]}; }}
+QSpinBox:focus, QDoubleSpinBox:focus {{ border: 1px solid {p["accent"]}; }}
 QSpinBox::up-button, QDoubleSpinBox::up-button {{
     subcontrol-origin: border;
     subcontrol-position: top right;
@@ -371,7 +380,7 @@ QDoubleSpinBox::up-arrow:disabled, QDoubleSpinBox::down-arrow:disabled {{
 QPushButton {{
     background: transparent;
     border: 1px solid {p["rule"]};
-    border-radius: 2px;
+    border-radius: {RADIUS}px;
     padding: 7px 14px;
     font-size: 12px;
     font-weight: 600;
@@ -397,12 +406,43 @@ QPushButton#Primary:disabled {{
 QPushButton#Ghost {{ border: none; color: {p["text_dim"]}; padding: 6px 8px; }}
 QPushButton#Ghost:hover {{ color: {p["accent"]}; }}
 
+/* ── 预设标签：小而密，像便签，不喧宾夺主 ── */
+QPushButton#Preset {{
+    background: {p["scrim"]};
+    border: 1px solid {p["rule_soft"]};
+    border-radius: 9px;
+    padding: 2px 9px;
+    font-size: 11px;
+    font-weight: 500;
+    color: {p["text_dim"]};
+    letter-spacing: 0;
+}}
+QPushButton#Preset:hover {{
+    background: {p["hover"]};
+    border-color: {p["accent_dim"]};
+    color: {p["accent"]};
+}}
+QPushButton#Preset:pressed {{ background: {p["selection"]}; }}
+QPushButton#PresetCustom {{
+    background: transparent;
+    border: 1px dashed {p["rule"]};
+    border-radius: 9px;
+    padding: 2px 9px;
+    font-size: 11px;
+    color: {p["text_faint"]};
+    letter-spacing: 0;
+}}
+QPushButton#PresetCustom:hover {{
+    border-color: {p["accent_dim"]};
+    color: {p["accent"]};
+}}
+
 /* ── 分段切换：右栏一次只呈现一块 ── */
 QPushButton#Seg {{
     border: none;
     border-bottom: 2px solid transparent;
     border-radius: 0;
-    padding: 6px 10px;
+    padding: 6px 12px;
     font-size: 12px;
     font-weight: 600;
     color: {p["text_faint"]};
@@ -416,14 +456,14 @@ QPushButton#Seg:checked {{
 
 QPushButton#WinBtn {{
     border: none; border-radius: 0; padding: 0;
-    font-size: 15px; color: {p["text_faint"]};
+    font-size: 14px; color: {p["text_faint"]};
 }}
 QPushButton#WinBtn:hover {{ background: {p["hover"]}; color: {p["text"]}; }}
 QPushButton#WinClose:hover {{ background: {p["danger"]}; color: #FFFFFF; }}
 
 QPushButton#ThemeToggle {{
     border: 1px solid {p["rule"]};
-    border-radius: 2px;
+    border-radius: {RADIUS}px;
     padding: 4px 10px;
     font-size: 11px;
     font-weight: 600;
@@ -468,13 +508,13 @@ QListWidget#Corpus::item:selected {{ color: {p["accent"]}; background: transpare
 /* ── 滚动条：细、静、不抢戏 ── */
 QScrollBar:vertical {{ background: transparent; width: 10px; margin: 0; }}
 QScrollBar::handle:vertical {{
-    background: {p["rule"]}; min-height: 40px; border-radius: 0; margin: 2px 3px;
+    background: {p["rule"]}; min-height: 40px; border-radius: 5px; margin: 2px 3px;
 }}
 QScrollBar::handle:vertical:hover {{ background: {p["text_faint"]}; }}
 QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; width: 0; }}
 QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
 QScrollBar:horizontal {{ background: transparent; height: 10px; }}
-QScrollBar::handle:horizontal {{ background: {p["rule"]}; min-width: 40px; margin: 3px 2px; }}
+QScrollBar::handle:horizontal {{ background: {p["rule"]}; min-width: 40px; border-radius: 5px; margin: 3px 2px; }}
 
 /* ── 统计表：列表式，不设网格线 ── */
 QTableWidget {{
@@ -502,12 +542,13 @@ QHeaderView::section {{
 QProgressBar {{
     background: {p["hover"]};
     border: none;
+    border-radius: 3px;
     height: 15px;
     text-align: center;
     color: {p["text"]};
     font-size: 10px;
 }}
-QProgressBar::chunk {{ background: {p["accent_dim"]}; }}
+QProgressBar::chunk {{ background: {p["accent_dim"]}; border-radius: 3px; }}
 
 /* ── 统计数字：用衬线，与普通标签区分开 ── */
 QLabel#StatValue {{
@@ -521,6 +562,7 @@ QLabel#StatValue {{
 QListWidget#Plain {{
     background: transparent;
     border: 1px solid {p["rule"]};
+    border-radius: {RADIUS}px;
     outline: none;
 }}
 QListWidget#Plain::item {{
@@ -535,16 +577,21 @@ QListWidget#Plain::item:selected {{ background: {p["hover"]}; color: {p["accent"
 /* ── 其它 ── */
 QToolTip {{
     background: {p["input_bg"]}; color: {p["text"]};
-    border: 1px solid {p["rule"]}; padding: 4px 7px; font-size: 11px;
+    border: 1px solid {p["rule"]}; border-radius: {RADIUS}px;
+    padding: 4px 8px; font-size: 11px;
 }}
 QMenu {{
-    background: {p["input_bg"]}; border: 1px solid {p["rule"]}; padding: 4px;
+    background: {p["input_bg"]}; border: 1px solid {p["rule"]};
+    border-radius: {RADIUS_LG}px; padding: 5px;
 }}
+QMenu::separator {{ height: 1px; background: {p["rule_soft"]}; margin: 4px 6px; }}
 QMenu::item {{ padding: 6px 22px 6px 12px; font-size: 12px; color: {p["text_dim"]}; }}
 QMenu::item:selected {{ background: {p["hover"]}; color: {p["text"]}; }}
 QCheckBox {{ font-size: 12px; color: {p["text_dim"]}; spacing: 7px; }}
 QCheckBox::indicator {{
-    width: 13px; height: 13px; border: 1px solid {p["rule"]}; background: {p["input_bg"]};
+    width: 13px; height: 13px; border: 1px solid {p["rule"]};
+    border-radius: 3px; background: {p["input_bg"]};
 }}
+QCheckBox::indicator:hover {{ border-color: {p["accent_dim"]}; }}
 QCheckBox::indicator:checked {{ background: {p["accent"]}; border-color: {p["accent"]}; }}
 """

@@ -10,9 +10,16 @@ dist/
 __pycache__/
 *.pyc
 
+# 用户自定义预设（含个人设定片段，不入库）
+presets.json
+
 # 杂项
 _t.py
 _top.png
+_shot.py
+_measure.py
+_g*.png
+_p.png
 
 # 开发过程记录（内部笔记，不随仓库发布）
 .workbuddy/

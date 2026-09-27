@@ -82,8 +82,11 @@ build.bat
 
 ## Features
 
-- **Premise.** Write a sentence, then let the AI expand it into characters, power tiers,
-  factions and place names. Or ask it for title candidates.
+- **Premise.** Write a sentence — or tap the **preset tags** above the box to append
+  ready-made writing directives (46 built in, covering common genres and tropes; stack
+  them freely, e.g. urban + system + power-fantasy). "存为预设" saves the current
+  premise as your own tag. Then let the AI expand it into characters, power tiers,
+  factions and place names, or ask it for title candidates.
 - **Drafting.** Continue (Ctrl+Enter) or auto-generate up to a target length. Empty drafts
   use an opening mode that starts on a concrete scene with a hook.
 - **Self-updating premise.** After auto-generation, the app reads the whole manuscript and
@@ -91,9 +94,12 @@ build.bat
 - **Rewrites.** Polish / expand / condense / rewrite on a selection, streamed in place.
 - **Truncation handling.** When a reply is cut off mid-sentence, the app re-requests with
   the partial text fed back and asks it to continue without repeating, up to 4 rounds.
+- **Looks.** Three palettes (blue / pink / night). Engine Settings offers an optional
+  **glow border** — a seven-colour gradient flowing and breathing around the window edge,
+  or a single colour picked from a palette.
+
 - **Plus** writing statistics, version history with undoable rollback, a dedicated reader
-  window, three palettes, chapter drag-and-drop and merging, drag-and-drop corpus import,
-  and export to text.
+  window, chapter drag-and-drop and merging, drag-and-drop corpus import, and export to text.
 
 ## Context assembly
 
@@ -106,16 +112,30 @@ Four layers, in priority order:
 | Reference corpus | Files you import | Hard constraints, must not be contradicted |
 | Recent window | Tail of the current chapter | Keeps sentences continuous |
 
-## Style bans: why the output doesn't read like AI
+## Anti-AI-tell: why the output doesn't read like AI
 
-What exposes AI fiction isn't plot, it's that the model **thinks it's being literary**:
-three metaphors per paragraph, walls of adjectives, rule-of-three lists,
-"a flicker crossed his eyes"-grade filler. Readers spot it in two paragraphs and stop.
+There is more than one tell. `ai.py` defines three non-overlapping blocks, shared across
+the continuation, opening, premise-expansion, rewrite and review prompts:
 
-`ai.py` defines a single `STYLE_BAN` block shared by the continuation, opening and
-rewrite prompts: at most one metaphor per paragraph, at most three adjectives, no
-rule-of-three, no nominalized emotions, no narrator's editorializing, mandatory
-long/short sentence interleaving, plus a blacklist of stock phrases.
+**`STYLE_BAN` — the register.** The model **thinks it's being literary**: three metaphors
+per paragraph, walls of adjectives, rule-of-three lists, "a flicker crossed his eyes"-grade
+filler. Constrained to at most one metaphor per paragraph, at most three adjectives, no
+rule-of-three, no nominalized emotions, no narrator's editorializing, mandatory long/short
+sentence interleaving, plus a blacklist of stock phrases.
+
+**`NAME_BAN` — the names.** LLMs regress hard to the mean when naming: whatever the genre,
+they collide on the same handful (Zhao Wuji, Ye Fan, Xiao Yan). That collision is a
+fingerprint. About 20 worn-out names are called out by name; stacking "dragon / proud /
+heaven / emperor / god" into a "badass" name is banned; names must fit the character's
+station and era. Applies to newly introduced characters only — names already in the text
+are kept as-is.
+
+**`HUMAN_VOICE` — the people and the drama.** Aimed at the three falsest things about
+machine-written characters: dialogue that is always correct (now it must dodge, interrupt,
+leave things unsaid, and every line must want something), characters who are always good
+(villains must actually do wrong; the protagonist may be selfish or cowardly; the guilty
+may feel no remorse), and plots with no manoeuvring (someone must be scheming each beat,
+information asymmetry is required, lying and acting are allowed, twists must be planted).
 
 Real-world testing is ongoing. Try it on your own manuscript and open an issue if it
 doesn't pull its weight.
@@ -126,15 +146,14 @@ doesn't pull its weight.
 - **The anti-AI-tell mechanism is prompt-only.** Nothing deterministically catches
   violations yet; a rules-based detector like InkOS's is on the roadmap.
 - **Prompt changes have not been tested end-to-end against a live API** (no key
-  available). The 75 smoke-test assertions cover context assembly and logic, not
+  available). The 114 smoke-test assertions cover context assembly and logic, not
   generation quality.
-- **No CI.** Tests are run manually.
 - **Chinese UI only.** No web or mobile client.
 
 ## Roadmap
 
 - [ ] Upgrade the anti-AI-tell work from prompts to deterministic rules + spot-fix
-- [ ] Run `smoke_test.py` in GitHub Actions
+- [x] Run `smoke_test.py` in GitHub Actions (Python 3.10 / 3.12, plus a static check)
 - [ ] Foreshadowing ledger: list planted hooks and flag uncollected ones
 - [ ] Style fingerprint distilled from reference corpus, injected into prompts
 
@@ -144,9 +163,11 @@ doesn't pull its weight.
 theme.py        design tokens and stylesheets (three palettes)
 store.py        data model, one JSON file per novel, under projects/
 ai.py           streaming, context assembly, memory compression, rewrites
+presets.py      premise presets (46 built in + user-defined)
 ui.py           UI
 main.py         entry point
-smoke_test.py   smoke tests (75 assertions, needs PyQt6)
+smoke_test.py   smoke tests (114 assertions, needs PyQt6)
+.github/        CI: smoke tests + static check
 build.bat       Windows packaging script
 screenshots/    images used by the READMEs
 ```
@@ -164,6 +185,13 @@ inside a temp directory and never touch your novel library.
 Each novel is a JSON file under `projects/`. Every save first drops a snapshot into
 `projects/backup`, keeping the most recent 40. "作品 → 历史版本" lists them and can roll
 back; rolling back snapshots the current state first, so the rollback itself is undoable.
+
+Autosave fires every 8 seconds, but **snapshots are throttled to one per 60 seconds** —
+otherwise 40 restore points only cover a few minutes of writing, while the whole point of
+version history is getting back to a paragraph you deleted an hour ago. With throttling,
+40 snapshots span roughly 45 minutes of continuous writing. Four milestones bypass the
+throttle and always write one: finishing or aborting a generation run, finishing a rewrite,
+switching projects, and rolling back.
 
 `projects/` contains your API key and manuscript text, which is why it is gitignored.
 

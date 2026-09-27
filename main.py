@@ -6,6 +6,7 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import QApplication
 
+import store
 import theme as T
 from ui import Window
 
@@ -17,6 +18,7 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("续墨")
     app.setApplicationDisplayName("续墨")
+    app.setApplicationVersion(store.APP_VERSION)
 
     base = QFont("Microsoft YaHei UI", 9)
     base.setHintingPreference(QFont.HintingPreference.PreferFullHinting)

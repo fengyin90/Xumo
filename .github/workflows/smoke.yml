@@ -1,0 +1,56 @@
+name: smoke
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  smoke:
+    name: smoke (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # README 承诺 3.10+，两个端点各跑一遍：
+        # 老的防止写出 3.11+ 语法，新的防止依赖尾端已失效。
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Qt 运行时与虚拟显示
+        # 冒烟测试会真实实例化主窗口和各个弹窗；offscreen 后端也需要这些
+        # xcb / GL 库，缺一个就起不来 Qt。
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libegl1 libgl1-mesa-glx libxkbcommon-x11-0 \
+            libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
+            libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 \
+            xvfb
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 冒烟测试
+        run: xvfb-run -a python smoke_test.py
+
+  lint:
+    name: static check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 安装 pyflakes
+        run: pip install pyflakes
+      - name: 未使用的导入 / 死变量
+        # 不装()、不查风格，只抓会把人绊倒的那种：引用了不存在的名字。
+        run: python -m pyflakes ai.py store.py theme.py ui.py main.py smoke_test.py

@@ -13,6 +13,9 @@ import uuid
 from dataclasses import dataclass, field, asdict
 from typing import Any
 
+# 版本号：随 CHANGELOG.md 同时更新，界面「作品」菜单底部与窗口标题可见。
+APP_VERSION = "1.1.4"
+
 # 数据目录：
 #   源码运行 → 项目目录下的 projects/
 #   打包成 exe → exe 所在目录下的 projects/（便携式：exe 挪到哪，作品就跟到哪）
@@ -26,6 +29,15 @@ LAST_FILE = os.path.join(PROJECTS_DIR, ".last")
 
 # 每次保存前留一个回滚点，最多保留这么多份
 BACKUP_KEEP = 40
+
+# 自动轮转的最小间隔（秒）。
+#
+# 自动保存是 8 秒一跳，而 snapshot 会把整个项目 JSON 复制一份。若每次存盘都
+# 拷，连续写作两分钟就吃掉十几份配额，四十份历史版本实际只覆盖几分钟 ——
+# 而历史版本存在的意义恰恰是"回到一小时前删掉的那段"。
+# 节流之后，四十份能覆盖约 45 分钟的连续写作，磁盘上的副本数量也少了。
+# 注意只作用于自动轮转：手动备份与回滚前的存档仍然是一存一份（force=True）。
+BACKUP_MIN_INTERVAL = 60.0
 
 
 def _uid() -> str:
@@ -41,13 +53,39 @@ def backup_dir() -> str:
     return os.path.join(PROJECTS_DIR, "backup")
 
 
-def snapshot(pid: str) -> str:
-    """把磁盘上的当前版本复制进 backup/，返回快照文件名。
+def _latest_snapshot_mtime(pid: str) -> float | None:
+    """最近一份快照的修改时间；没有则返回 None。"""
+    folder = backup_dir()
+    if not os.path.isdir(folder):
+        return None
+    newest = None
+    for name in os.listdir(folder):
+        if not name.startswith(pid + "-"):
+            continue
+        try:
+            mtime = os.stat(os.path.join(folder, name)).st_mtime
+        except OSError:
+            continue
+        if newest is None or mtime > newest:
+            newest = mtime
+    return newest
+
+
+def snapshot(pid: str, min_interval: float = 0.0) -> str:
+    """把磁盘上的当前版本复制进 backup/，返回快照文件名（跳过则返回空串）。
 
     唯一的存档入口：定期轮转与手动备份走同一段代码，避免两处规则漂移。
+
+    min_interval > 0 时，若最近一份快照还没到这个秒数就跳过 —— 见
+    BACKUP_MIN_INTERVAL。手写 _rotate_backup 的地方（自动保存）用节流值，
+    用户主动点「备份」的地方传 0。
     """
     src = os.path.join(PROJECTS_DIR, f"{pid}.json")
     folder = backup_dir()
+    if min_interval > 0:
+        latest = _latest_snapshot_mtime(pid)
+        if latest is not None and time.time() - latest < min_interval:
+            return ""
     os.makedirs(folder, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
     dst = os.path.join(folder, f"{pid}-{stamp}.json")
@@ -126,7 +164,9 @@ def restore_backup(pid: str, name: str) -> "Project":
     """
     p = Project.from_dict(read_backup(pid, name))
     p.id = pid
-    p.save()
+    # 回滚前的存档不能用节流 —— 它是对"当前状态"的最后一份交代，
+    # 被跳过的话，一次错误的回滚就再没有回头路了。
+    p.save(force_backup=True)
     return p
 
 
@@ -180,6 +220,12 @@ class Settings:
     # 一键生成时，每写完一轮自动审校，不合格就按意见重写
     auto_review: bool = True
     theme: str = "blue"
+    # 窗口边缘的流光呼吸描边
+    glow_border: bool = False
+    # 七彩渐变（True）或单色（False）
+    glow_rainbow: bool = True
+    # 单色模式下的描边颜色
+    glow_color: str = "#3B6FD4"
     # 编辑区正文字号（px）
     editor_size: int = 16
     # 阅读窗口正文字号
@@ -259,21 +305,22 @@ class Project:
         p.current = max(0, min(p.current, len(p.chapters) - 1))
         return p
 
-    def _rotate_backup(self) -> None:
+    def _rotate_backup(self, force: bool = False) -> None:
         """把当前磁盘上的版本复制进 backup/，再写新版本。
 
-        用时间戳命名，按名倒序保留最近 BACKUP_KEEP 份。
+        用时间戳命名，保留最近 BACKUP_KEEP 份（按修改时间，见 prune_backups）。
+        force=True 用于「回滚前的存档」这类必须留下证据的场合，跳过节流。
         """
         if not os.path.exists(self.path()):
             return
         try:
-            snapshot(self.id)
+            snapshot(self.id, 0.0 if force else BACKUP_MIN_INTERVAL)
         except OSError:
             pass  # 备份失败不该阻断保存
 
-    def save(self) -> None:
+    def save(self, force_backup: bool = False) -> None:
         os.makedirs(PROJECTS_DIR, exist_ok=True)
-        self._rotate_backup()
+        self._rotate_backup(force=force_backup)
         tmp = self.path() + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(self.to_dict(), f, ensure_ascii=False, indent=2)

@@ -455,6 +455,114 @@ check("保存后配色不丢", dlg2.result_settings().theme == "night")
 p.settings.theme = "blue"
 check("自动审校开关默认开启", dlg2.result_settings().auto_review is True)
 
+print("\n[12] 手稿改动：程序写入不许伪装成作者写的，作者写的也不许漏")
+_p = win.desk.paper
+_p.load_body("第一段。\n\n第二段。")
+win._dirty = False
+win.inspector.premise.setPlainText("都市修仙，外卖员主角")   # 载入式写入：不标脏
+win._dirty = False
+_p.swap_body("整体替换后的正文。")
+check("swap_body 退出后不再静默", _p.is_quiet() is False)
+win._dirty = False
+_p.setPlainText("作者接着敲的字。")                          # 模拟用户编辑
+check("swap_body 之后用户编辑仍然算改动", win._dirty is True, repr(win._dirty))
+
+win._dirty = False
+_p.replace_tail(4, "改写过的尾巴。")
+check("replace_tail 退出后不再静默", _p.is_quiet() is False)
+win._dirty = False
+_p.setPlainText("又敲了一句。")
+check("replace_tail 之后用户编辑仍然算改动", win._dirty is True)
+
+# 载入章节会在收尾处施加块格式，那次 textChanged 若不被罩住，就会被当成
+# 用户编辑 —— 表现是「一启动 8 秒后白存一次盘、还轮转掉一份备份」。
+q = store.new_project("载入标脏测试")
+q.chapters[0].body = "第一段。\n\n第二段。\n\n第三段。"
+win._dirty = False
+win.desk.set_chapter(q.chapters[0])
+check("载入章节不会被误判成用户编辑", win._dirty is False, repr(win._dirty))
+
+print("\n[12b] 右栏设定 / 记忆也算改动")
+win._dirty = False
+win.inspector.premise.setPlainText("改过的设定方向")
+check("编辑设定算改动", win._dirty is True)
+win._dirty = False
+win.inspector.memory.setPlainText("改过的前情记忆")
+check("编辑记忆算改动", win._dirty is True)
+
+print("\n[12c] 续写前必须先把界面上的编辑并回 project")
+_tt = store.new_project("并回测试")
+_tt.settings.api_key = "dummy"
+_tt.chapters = [
+    store.Chapter("aa11", "第一章", "存盘过的旧正文内容。"),
+    store.Chapter("bb22", "第二章", "另一章。"),
+]
+_tt.current = 0
+_tt.premise = "旧设定"
+win.project = _tt
+win.desk.set_chapter(_tt.chapter)
+win.inspector.premise.setPlainText("作者刚写好的新设定")
+win.desk.paper.setPlainText("存盘过的旧正文内容。作者刚敲进去还没存的新字。")
+_seen: list[tuple[str, str]] = []
+_real_build = AI.build_messages
+AI.build_messages = lambda proj, **kw: (
+    _seen.append((proj.chapter.body, proj.premise)) or [{"role": "user", "content": "x"}]
+)
+_real_worker = win._worker
+win._worker = lambda fn: None      # 不真的发请求
+try:
+    win._start_write()
+finally:
+    AI.build_messages = _real_build
+    win._worker = _real_worker
+check("续写装配到了最新正文", _seen and _seen[-1][0] == "存盘过的旧正文内容。作者刚敲进去还没存的新字。",
+      repr(_seen[-1][0]) if _seen else "没调用 build_messages")
+check("续写装配到了最新设定", _seen and _seen[-1][1] == "作者刚写好的新设定",
+      repr(_seen[-1][1]) if _seen else "没调用 build_messages")
+
+print("\n[13] 流式期间不许换章、不许换作品")
+win._set_busy(True)
+check("忙碌时章节列表被锁住", win.rail.list.isEnabled() is False)
+check("忙碌时「作品」菜单被锁住", win.titlebar.works_btn.isEnabled() is False)
+check("忙碌时 _guard_idle 拦住请求", win._guard_idle() is False)
+_before = win.project.current
+win._pick_chapter((_before + 1) % max(1, len(win.project.chapters)))
+check("忙碌时切章被拒绝", win.project.current == _before, f"{_before} -> {win.project.current}")
+win._set_busy(False)
+check("收尾后解锁", win.rail.list.isEnabled() and win.titlebar.works_btn.isEnabled())
+check("空闲时 _guard_idle 放行", win._guard_idle() is True)
+
+print("\n[13b] 换作品前先收掉指向旧作品的窗口")
+win._open_stats()
+win.open_versions()
+win.open_reader()
+_old_stats, _old_ver, _old_reader = win._stats, win._versions, win._reader
+check("三个面板都打开了", None not in (_old_stats, _old_ver, _old_reader))
+win._close_panels()
+check("统计窗已关闭", _old_stats.isVisible() is False)
+check("版本窗已关闭", _old_ver.isVisible() is False)
+check("阅读窗已关闭", _old_reader.isVisible() is False)
+check("引用已清空", win._stats is None and win._versions is None and win._reader is None)
+
+print("\n[14] 备份节流：连续保存不再每 8 秒拷一份")
+_tp = store.new_project("节流测试")
+_tp.chapters[0].body = "正文。" * 3000
+_tp.save()
+_n0 = len(store.list_backups(_tp.id))
+_tp.chapters[0].body += "再写一点"
+_tp.save()
+_tp.chapters[0].body += "又写一点"
+_tp.save()
+_n1 = len(store.list_backups(_tp.id))
+check(f"节流窗口内连续保存只留一份（{_n0} -> {_n1}）", _n1 == _n0 + 1, f"{_n0} -> {_n1}")
+_tp.save(force_backup=True)
+check("强制保存一定留快照", len(store.list_backups(_tp.id)) == _n1 + 1)
+_bak_before = len(store.list_backups(_tp.id))
+_target = store.list_backups(_tp.id)[-1][0]
+store.restore_backup(_tp.id, _target)
+check("回滚前一定存档（可再次回退）", len(store.list_backups(_tp.id)) > _bak_before,
+      f"{_bak_before} -> {len(store.list_backups(_tp.id))}")
+
 print(f"\n{'=' * 46}\n通过 {PASSES} 项，失败 {len(FAILS)} 项")
 for f in FAILS:
     print("  FAILED:", f)

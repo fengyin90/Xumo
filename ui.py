@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import threading
@@ -19,20 +20,25 @@ import time
 from collections.abc import Callable
 
 from PyQt6.QtCore import (
-    QEasingCurve, QEvent, QObject, QPoint, QPropertyAnimation, Qt, QTimer, pyqtSignal,
+    QEasingCurve, QEvent, QObject, QPoint, QPropertyAnimation, QRect, QRectF,
+    QSize, Qt, QTimer, pyqtSignal,
 )
 from PyQt6.QtGui import (
-    QAction, QCursor, QTextBlockFormat, QTextCursor,
+    QAction, QColor, QConicalGradient, QCursor, QPainter, QPainterPath, QPen,
+    QRegion, QTextBlockFormat, QTextCursor,
 )
 from PyQt6.QtWidgets import (
     QAbstractItemView, QApplication, QButtonGroup, QDialog, QDoubleSpinBox, QFileDialog,
     QFrame, QGraphicsOpacityEffect, QGridLayout, QHBoxLayout, QHeaderView, QInputDialog,
+    QLayout,
     QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu, QMessageBox,
-    QCheckBox, QPlainTextEdit, QProgressBar, QPushButton, QSizeGrip, QSpinBox,
+    QCheckBox, QComboBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea,
+    QSizeGrip, QSpinBox,
     QStackedWidget, QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget,
 )
 
 import ai as AI
+import presets
 import store
 import theme as T
 from store import Chapter, Corpus, Project, Settings, _uid
@@ -114,6 +120,18 @@ class Manuscript(QTextEdit):
     def _apply_rhythm(self) -> None:
         if self._guard or self.document().characterCount() > self.MAX_RHYTHM_DOC:
             return
+        # 施加块格式本身会触发 textChanged —— 它永远是一次程序改动，不是作者
+        # 敲的。不罩住它，每次载入章节都会在收尾这里补一枪：textChanged 落到
+        # _on_text 上被当成用户编辑，8 秒后 autosave 白存一次盘、顺便轮转掉
+        # 一份备份。所有调用点都受益，不必在每个 load_* 里各自记得收尾。
+        prior = self._quiet
+        self._quiet = True
+        try:
+            self._apply_rhythm_inner()
+        finally:
+            self._quiet = prior
+
+    def _apply_rhythm_inner(self) -> None:
         self._guard = True
         try:
             cur = self.textCursor()
@@ -132,12 +150,21 @@ class Manuscript(QTextEdit):
             self._rhythm.start()
 
     # ── 对外 ──
+    #
+    # 静默作用域：setPlainText 会重建文档并触发 textChanged，这类写入必须全程
+    # 罩住 _quiet，否则会被当成用户编辑。进来之前先记住原值、出去时原样放回 ——
+    # 单纯赋值 True/False 会埋雷：某条路径提前抛错，或调用方记错了当前状态，
+    # _quiet 就永久停在 True，之后作者敲的字全都不算改动，autosave 静默失效，
+    # 直到关窗才发现稿子没存上。
     def load_body(self, text: str) -> None:
+        prior = self._quiet
         self._quiet = True
-        self.setPlainText(text)
-        self._quiet = False
-        self.moveCursor(QTextCursor.MoveOperation.Start)
-        self._apply_rhythm()
+        try:
+            self.setPlainText(text)
+            self.moveCursor(QTextCursor.MoveOperation.Start)
+            self._apply_rhythm()
+        finally:
+            self._quiet = prior
 
     def begin_stream(self) -> None:
         self._quiet = True
@@ -147,15 +174,19 @@ class Manuscript(QTextEdit):
         self.ensureCursorVisible()
 
     def swap_body(self, text: str) -> None:
-        """流式中途换章：整体替换内容，保持静默，光标落到末尾。"""
+        """流式中途换章：整体替换内容，光标落到末尾。"""
+        prior = self._quiet
         self._quiet = True
-        self.setPlainText(text)
-        cur = self.textCursor()
-        cur.movePosition(QTextCursor.MoveOperation.End)
-        self.setTextCursor(cur)
-        # setPlainText 重建文档会清掉块格式，必须重新施加，否则换章后
-        # 段落间距与其它章不一致。
-        self._apply_rhythm()
+        try:
+            self.setPlainText(text)
+            cur = self.textCursor()
+            cur.movePosition(QTextCursor.MoveOperation.End)
+            self.setTextCursor(cur)
+            # setPlainText 重建文档会清掉块格式，必须重新施加，否则换章后
+            # 段落间距与其它章不一致。
+            self._apply_rhythm()
+        finally:
+            self._quiet = prior
         self.ensureCursorVisible()
 
     def append_delta(self, text: str) -> None:
@@ -174,22 +205,23 @@ class Manuscript(QTextEdit):
         self._apply_rhythm()
 
     def replace_tail(self, n_remove: int, new_text: str) -> None:
-        """把正文末尾 n_remove 个字替换成 new_text（流式期间自动审校用）。
-
-        保持 _quiet=True，避免这次替换被当成用户编辑；流结束由 end_stream 收尾。
-        """
+        """把正文末尾 n_remove 个字替换成 new_text（流式期间自动审校用）。"""
         full = self.toPlainText()
         if n_remove > len(full):
             n_remove = len(full)
         keep = full[: len(full) - n_remove] if n_remove else full
+        prior = self._quiet
         self._quiet = True
-        self.setPlainText(keep + new_text)
-        cur = self.textCursor()
-        cur.movePosition(QTextCursor.MoveOperation.End)
-        self.setTextCursor(cur)
-        # setPlainText 清掉了块格式：不补回来，被重写的这段就没有行距/段距，
-        # 与前面的正文格式对不上（截图里「间距忽大忽小」即由此而来）。
-        self._apply_rhythm()
+        try:
+            self.setPlainText(keep + new_text)
+            cur = self.textCursor()
+            cur.movePosition(QTextCursor.MoveOperation.End)
+            self.setTextCursor(cur)
+            # setPlainText 清掉了块格式：不补回来，被重写的这段就没有行距/段距，
+            # 与前面的正文格式对不上（截图里「间距忽大忽小」即由此而来）。
+            self._apply_rhythm()
+        finally:
+            self._quiet = prior
         self.ensureCursorVisible()
 
     def body(self) -> str:
@@ -270,6 +302,15 @@ def rule(soft: bool = False) -> QFrame:
     return f
 
 
+def vrule(soft: bool = False, height: int = 0) -> QFrame:
+    f = QFrame()
+    f.setFixedWidth(1)
+    if height:
+        f.setFixedHeight(height)
+    f.setProperty("role", "ruleSoft" if soft else "rule")
+    return f
+
+
 def section_title(text: str) -> QLabel:
     lb = QLabel(text)
     lb.setObjectName("SectionTitle")
@@ -316,6 +357,190 @@ def ghost_button(text: str) -> QPushButton:
     return b
 
 
+class FlowLayout(QLayout):
+    """自动换行的水平布局。
+
+    Qt 没有内置这个 —— QHBoxLayout 会把控件一路挤出边界。预设标签有几十个，
+    必须按容器宽度折行。
+    """
+
+    def __init__(self, parent=None, spacing: int = 6):
+        super().__init__(parent)
+        self._items: list[QLayoutItem] = []
+        self._spacing = spacing
+        self.setContentsMargins(0, 0, 0, 0)
+
+    def addItem(self, item) -> None:  # noqa: N802 (Qt 接口)
+        self._items.append(item)
+
+    def count(self) -> int:
+        return len(self._items)
+
+    def itemAt(self, i):  # noqa: N802
+        return self._items[i] if 0 <= i < len(self._items) else None
+
+    def takeAt(self, i):  # noqa: N802
+        return self._items.pop(i) if 0 <= i < len(self._items) else None
+
+    def expandingDirections(self):  # noqa: N802
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self) -> bool:  # noqa: N802
+        return True
+
+    def heightForWidth(self, width: int) -> int:  # noqa: N802
+        return self._layout(QRect(0, 0, width, 0), apply=False)
+
+    def setGeometry(self, rect) -> None:  # noqa: N802
+        super().setGeometry(rect)
+        self._layout(rect, apply=True)
+
+    def sizeHint(self):  # noqa: N802
+        return self.minimumSize()
+
+    def minimumSize(self):  # noqa: N802
+        size = QSize()
+        for it in self._items:
+            size = size.expandedTo(it.minimumSize())
+        m = self.contentsMargins()
+        return size + QSize(m.left() + m.right(), m.top() + m.bottom())
+
+    def _layout(self, rect: QRect, apply: bool) -> int:
+        """逐行摆放；apply=False 时只算高度不实际移动。"""
+        m = self.contentsMargins()
+        x = rect.x() + m.left()
+        y = rect.y() + m.top()
+        right = rect.right() - m.right()
+        line_h = 0
+        for it in self._items:
+            w = it.sizeHint().width()
+            h = it.sizeHint().height()
+            if x + w > right and line_h > 0:
+                x = rect.x() + m.left()
+                y += line_h + self._spacing
+                line_h = 0
+            if apply:
+                it.setGeometry(QRect(QPoint(x, y), it.sizeHint()))
+            x += w + self._spacing
+            line_h = max(line_h, h)
+        return y + line_h - rect.y() + m.bottom()
+
+
+# ══════════════════════════════════════════════════════════
+#  流光呼吸边框
+# ══════════════════════════════════════════════════════════
+
+# 七彩流光色带：红 → 橙 → 黄 → 绿 → 青 → 蓝 → 靛 → 紫 → 粉，首尾闭环
+RAINBOW = [
+    "#FF3B30", "#FF9500", "#FFCC00", "#34C759", "#00C7B8",
+    "#0A84FF", "#5856D6", "#AF52DE", "#FF2D9B",
+]
+
+# 单色模式的预设调色板
+GLOW_PALETTE = [
+    "#FF3B30", "#FF9500", "#FFCC00", "#34C759",
+    "#00C7B8", "#3B6FD4", "#8E6BFF", "#FF2D9B",
+]
+
+
+class GlowBorder(QWidget):
+    """窗口边缘的流光 + 呼吸描边。
+
+    覆盖在窗口最上层的透明控件，只负责画一圈渐变描边：
+      · 流光 —— QConicalGradient 的起始角随时间推进，颜色沿边框环行。
+      · 呼吸 —— 描边透明度按正弦起伏，整体明暗有节律。
+
+    两种取色模式：
+      · 七彩渐变（默认）—— 九色色带闭环，绕边框流转。
+      · 单色 —— 取调色板色，派生出亮/暗三阶，同色系内流动。
+
+    鼠标事件一律穿透，不影响任何交互。
+    """
+
+    FRAME_MS = 33          # ≈30fps，够顺滑又不与流式渲染抢 CPU
+    THICKNESS = 5.0        # 描边粗细（逻辑像素）
+    CORNER = 16.0          # 圆角半径 —— 与窗口遮罩同值，描边才贴得住
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("GlowBorder")
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self._angle = 0.0
+        self._phase = 0.0
+        self._on = False      # 未启用时不绘制
+        self._rainbow = True
+        self._color = "#3B6FD4"
+        self._timer = QTimer(self)
+        self._timer.setInterval(self.FRAME_MS)
+        self._timer.timeout.connect(self._tick)
+
+    def configure(self, rainbow: bool, color: str) -> None:
+        """设置取色模式与单色值。"""
+        self._rainbow = bool(rainbow)
+        self._color = color or "#3B6FD4"
+        self.update()
+
+    def _stops(self) -> list[str]:
+        """渐变停靠点。首尾同色，闭环才不会有接缝。"""
+        if self._rainbow:
+            return RAINBOW + [RAINBOW[0]]
+        c = QColor(self._color)
+        hi = c.lighter(145).name()
+        lo = c.darker(135).name()
+        return [hi, c.name(), lo, hi]
+
+    def start(self) -> None:
+        self._on = True
+        if not self._timer.isActive():
+            self._timer.start()
+
+    def stop(self) -> None:
+        self._on = False
+        self._timer.stop()
+        self.update()
+
+    def _tick(self) -> None:
+        self._angle = (self._angle + 1.6) % 360.0
+        self._phase += 0.075
+        self.update()
+
+    def paintEvent(self, _e) -> None:
+        if not getattr(self, "_on", False):
+            return
+        stops = self._stops()
+        if not stops:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        w, h = self.width(), self.height()
+        t = self.THICKNESS
+        m = t / 2
+        rect = QRectF(m, m, w - t, h - t)
+
+        # 呼吸：透明度在 0.6 ~ 1.0 之间摆动
+        breathe = 0.8 + 0.2 * math.sin(self._phase)
+
+        grad = QConicalGradient(rect.center(), -self._angle)
+        n = len(stops) - 1
+        for i, c in enumerate(stops):
+            col = QColor(c)
+            col.setAlphaF(breathe)
+            grad.setColorAt(i / n, col)
+
+        pen = QPen()
+        pen.setBrush(grad)
+        pen.setWidthF(t)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+
+        p.setPen(pen)
+        p.drawRoundedRect(rect, self.CORNER - t / 2, self.CORNER - t / 2)
+        p.end()
+
+
 # ══════════════════════════════════════════════════════════
 #  标题栏
 # ══════════════════════════════════════════════════════════
@@ -337,7 +562,7 @@ class TitleBar(QWidget):
         brand.setObjectName("Brand")
         row.addWidget(brand, 0, Qt.AlignmentFlag.AlignVCenter)
 
-        row.addSpacing(T.GAP)
+        row.addSpacing(T.GAP_LG)
 
         # 作品名：可点击重命名 —— 层级上仅次于品牌本身
         self.title_lbl = QLabel("")
@@ -345,11 +570,11 @@ class TitleBar(QWidget):
         self.title_lbl.setCursor(Qt.CursorShape.PointingHandCursor)
         self.title_lbl.setToolTip("点击重命名")
         self.title_lbl.mousePressEvent = lambda e: self._win.rename_project()
-        row.addWidget(self.title_lbl, 0, Qt.AlignmentFlag.AlignBottom)
+        row.addWidget(self.title_lbl, 0, Qt.AlignmentFlag.AlignVCenter)
 
         self.crumb = QLabel("")
         self.crumb.setObjectName("Crumb")
-        row.addWidget(self.crumb, 0, Qt.AlignmentFlag.AlignBottom)
+        row.addWidget(self.crumb, 0, Qt.AlignmentFlag.AlignVCenter)
         row.addStretch(1)
 
         self.works_btn = QPushButton("作品")
@@ -358,7 +583,7 @@ class TitleBar(QWidget):
         self.works_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.works_btn.clicked.connect(self._win.works_menu)
         row.addWidget(self.works_btn)
-        row.addSpacing(T.GAP_SM)
+        row.addSpacing(T.GAP)
 
         self.read_btn = QPushButton("阅读")
         self.read_btn.setObjectName("ThemeToggle")
@@ -366,7 +591,7 @@ class TitleBar(QWidget):
         self.read_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.read_btn.clicked.connect(self._win.open_reader)
         row.addWidget(self.read_btn)
-        row.addSpacing(T.GAP_SM)
+        row.addSpacing(T.GAP)
 
         self.export_btn = QPushButton("导出")
         self.export_btn.setObjectName("ThemeToggle")
@@ -374,7 +599,7 @@ class TitleBar(QWidget):
         self.export_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.export_btn.clicked.connect(self._win.export_menu)
         row.addWidget(self.export_btn)
-        row.addSpacing(T.GAP_SM)
+        row.addSpacing(T.GAP)
 
         self.theme_btn = QPushButton(T.label_for(T.current_palette()))
         self.theme_btn.setObjectName("ThemeToggle")
@@ -383,6 +608,9 @@ class TitleBar(QWidget):
         self.theme_btn.clicked.connect(self._cycle_theme)
         row.addWidget(self.theme_btn)
         row.addSpacing(T.GAP_SM)
+
+        row.addSpacing(T.GAP)
+        row.addWidget(vrule(True, 22), 0, Qt.AlignmentFlag.AlignVCenter)
 
         for label, obj, slot in (
             ("—", "WinBtn", self._win.showMinimized),
@@ -485,16 +713,18 @@ class Rail(QWidget):
         col.setSpacing(T.GAP_SM)
 
         head = QHBoxLayout()
-        head.setContentsMargins(16, 0, 14, 0)
+        head.setContentsMargins(T.SIDE_PAD, 0, T.SIDE_PAD, 0)
         head.addWidget(section_title("章节"))
         head.addStretch(1)
         self.count = hint("")
         head.addWidget(self.count)
         col.addLayout(head)
+        col.addWidget(rule(soft=True))
 
         self.list = ChapterList()
         self.list.setObjectName("Chapters")
         self.list.setFrameShape(QFrame.Shape.NoFrame)
+        self.list.setSpacing(1)
         self.list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.list.customContextMenuRequested.connect(self._menu)
         self.list.currentRowChanged.connect(self._on_row)
@@ -503,7 +733,7 @@ class Rail(QWidget):
 
         col.addWidget(rule(soft=True))
         foot = QHBoxLayout()
-        foot.setContentsMargins(14, 0, 14, 0)
+        foot.setContentsMargins(T.SIDE_PAD, 0, T.SIDE_PAD, 0)
         b = ghost_button("＋  新建章节")
         b.clicked.connect(self.added.emit)
         foot.addWidget(b)
@@ -599,7 +829,7 @@ class Desk(QWidget):
         self._last_ctx_color = ""
 
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(T.GAP_XL, T.GAP_LG, T.GAP_XL, T.GAP)
+        outer.setContentsMargins(T.GAP_XL, T.GAP_XL, T.GAP_XL, T.GAP)
         outer.setSpacing(0)
 
         # ── 文本列（视口是海报，正文列必须窄）──
@@ -615,7 +845,7 @@ class Desk(QWidget):
         self.title.editingFinished.connect(lambda: self.retitled.emit(self.title.text().strip() or "未命名"))
         stack.addWidget(self.title)
 
-        stack.addSpacing(T.GAP_SM)
+        stack.addSpacing(T.GAP)
 
         meta = QHBoxLayout()
         meta.setContentsMargins(0, 0, 0, 0)
@@ -635,16 +865,21 @@ class Desk(QWidget):
         stack.addWidget(self.paper, 1)
 
         center = QHBoxLayout()
-        center.addStretch(1)
+        center.addStretch(0)
         center.addWidget(col, 1)
-        center.addStretch(1)
+        center.addStretch(0)
         outer.addLayout(center, 1)
 
-        # ── 操作栏 ──
-        outer.addSpacing(T.GAP)
+        # ── 操作栏（rule 收进 MEASURE 宽度，与标题下横线对齐）──
+        outer.addSpacing(T.GAP_LG)
         bar_col = QWidget()
         bar_col.setMaximumWidth(T.MEASURE)
-        bar = QHBoxLayout(bar_col)
+        bar_col_v = QVBoxLayout(bar_col)
+        bar_col_v.setContentsMargins(0, 0, 0, 0)
+        bar_col_v.setSpacing(T.GAP_SM)
+        bar_col_v.addWidget(rule(soft=True))
+
+        bar = QHBoxLayout()
         bar.setContentsMargins(0, 0, 0, 0)
         bar.setSpacing(T.GAP_SM)
 
@@ -676,11 +911,12 @@ class Desk(QWidget):
         bar.addStretch(1)
         self.status = hint("")
         bar.addWidget(self.status)
+        bar_col_v.addLayout(bar)
 
         bar_center = QHBoxLayout()
-        bar_center.addStretch(1)
+        bar_center.addStretch(0)
         bar_center.addWidget(bar_col, 1)
-        bar_center.addStretch(1)
+        bar_center.addStretch(0)
         outer.addLayout(bar_center)
 
     def _more_menu(self) -> None:
@@ -766,6 +1002,8 @@ class Inspector(QWidget):
     expand = pyqtSignal()
     names = pyqtSignal()
     drop_corpus = pyqtSignal(int)
+    preset_applied = pyqtSignal(str)   # 并把并好的整段设定交出去，由主窗标记脏
+
 
     def __init__(self):
         super().__init__()
@@ -783,7 +1021,7 @@ class Inspector(QWidget):
         self._seg_group.setExclusive(True)
         self._seg_btns: list[QPushButton] = []
         seg = QHBoxLayout()
-        seg.setContentsMargins(14, 0, 14, 0)
+        seg.setContentsMargins(T.SIDE_PAD, 0, T.SIDE_PAD, 0)
         seg.setSpacing(T.GAP_XS)
         for i, name in enumerate(("语料", "设定", "记忆")):
             b = QPushButton(name)
@@ -796,6 +1034,7 @@ class Inspector(QWidget):
             self._seg_btns.append(b)
         seg.addStretch(1)
         col.addLayout(seg)
+        col.addWidget(rule(soft=True))
         col.addWidget(self._stack, 1)
 
         # ── 页 0：语料 ──
@@ -803,7 +1042,7 @@ class Inspector(QWidget):
         v0 = QVBoxLayout(p0)
         v0.setContentsMargins(0, 0, 0, 0)
         v0.setSpacing(T.GAP_SM)
-        v0.addLayout(self._head("语料", "add"))
+        v0.addLayout(self._head("", "add"))
         self.corpus = QListWidget()
         self.corpus.setObjectName("Corpus")
         self.corpus.setFrameShape(QFrame.Shape.NoFrame)
@@ -811,7 +1050,7 @@ class Inspector(QWidget):
         self.corpus.customContextMenuRequested.connect(self._corpus_menu)
         v0.addWidget(self.corpus, 1)
         arow = QHBoxLayout()
-        arow.setContentsMargins(14, 0, 14, 0)
+        arow.setContentsMargins(T.SIDE_PAD, 0, T.SIDE_PAD, 0)
         arow.setSpacing(T.GAP_SM)
         self.analyze_btn = ghost_button("全面分析")
         self.analyze_btn.setToolTip("让 AI 通读语料与正文，产出人物、世界、脉络、笔法简报")
@@ -827,13 +1066,31 @@ class Inspector(QWidget):
         v1.setContentsMargins(0, 0, 0, 0)
         v1.setSpacing(T.GAP_SM)
         v1.addLayout(self._head("故事设定", None))
+
+        # ── 预设标签：点一下把该条并入设定框（追加，不覆盖）──
+        # 几十个标签会挤掉设定框，这里限高并允许内部滚动。
+        self._preset_wrap = QWidget()
+        self._preset_wrap.setObjectName("PresetWrap")
+        self._preset_flow = FlowLayout(self._preset_wrap, spacing=5)
+
+        preset_scroll = QScrollArea()
+        preset_scroll.setObjectName("PresetScroll")
+        preset_scroll.setWidgetResizable(True)
+        preset_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        preset_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        preset_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        preset_scroll.setMaximumHeight(132)
+        preset_scroll.setWidget(self._preset_wrap)
+        v1.addWidget(preset_scroll)
+        self.reload_presets()
+
         self.premise = self._notes(
             "写几句大方向即可，例如「都市修仙，主角是外卖员，捡到一枚会吐槽的系统」。"
-            "人名、地名、门派可点下方「取书名」旁的指令框生成，也可留空让开篇生成全权发挥。"
+            "点上方标签可一键并入常见设定；也可留空让开篇生成全权发挥。"
         )
         v1.addWidget(self.premise, 1)
         nrow = QHBoxLayout()
-        nrow.setContentsMargins(14, 0, 14, 0)
+        nrow.setContentsMargins(T.SIDE_PAD, 0, T.SIDE_PAD, 0)
         nrow.setSpacing(T.GAP_SM)
         self.expand_btn = ghost_button("补全设定")
         self.expand_btn.setToolTip("依据你写的大方向，自动补全人物、境界、势力、地名等")
@@ -843,6 +1100,10 @@ class Inspector(QWidget):
         self.names_btn.setToolTip("依据故事方向拟 6 个候选书名，点选即可改作品名")
         self.names_btn.clicked.connect(self.names.emit)
         nrow.addWidget(self.names_btn)
+        self.save_preset_btn = ghost_button("存为预设")
+        self.save_preset_btn.setToolTip("把当前设定整段存成一个标签，以后一键复用")
+        self.save_preset_btn.clicked.connect(self._save_preset)
+        nrow.addWidget(self.save_preset_btn)
         nrow.addStretch(1)
         v1.addLayout(nrow)
         self._stack.addWidget(p1)
@@ -860,8 +1121,9 @@ class Inspector(QWidget):
         self._seg_btns[0].setChecked(True)
 
         # ── 页脚 ──
+        col.addWidget(rule(soft=True))
         foot = QHBoxLayout()
-        foot.setContentsMargins(14, T.GAP_SM, 6, 6)
+        foot.setContentsMargins(T.SIDE_PAD, T.GAP_SM, 6, 6)
         self.engine_btn = ghost_button("引擎设置")
         foot.addWidget(self.engine_btn)
         foot.addStretch(1)
@@ -875,14 +1137,78 @@ class Inspector(QWidget):
 
     def _head(self, text: str, action: str | None) -> QHBoxLayout:
         h = QHBoxLayout()
-        h.setContentsMargins(14, 0, 14, 0)
-        h.addWidget(section_title(text))
+        h.setContentsMargins(T.SIDE_PAD, 0, T.SIDE_PAD, 0)
+        if text:
+            h.addWidget(section_title(text))
         h.addStretch(1)
         if action == "add":
             b = ghost_button("添加文件")
             b.clicked.connect(self.add_files.emit)
             h.addWidget(b)
         return h
+
+    # ── 预设标签 ──
+    def reload_presets(self) -> None:
+        """重建标签栏：内置在前、自定义在后。"""
+        flow = self._preset_flow
+        while flow.count():
+            it = flow.takeAt(0)
+            w = it.widget() if it is not None else None
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+
+        builtin, user = presets.all_presets()
+        for name, text in builtin:
+            self._add_preset_btn(name, text, custom=False)
+        for name, text in user:
+            self._add_preset_btn(name, text, custom=True)
+
+    def _add_preset_btn(self, name: str, text: str, custom: bool) -> None:
+        b = QPushButton(name)
+        b.setObjectName("PresetCustom" if custom else "Preset")
+        b.setCursor(Qt.CursorShape.PointingHandCursor)
+        b.setToolTip(text)
+        b.clicked.connect(lambda: self._apply_preset(name, text))
+        if custom:
+            b.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            b.customContextMenuRequested.connect(
+                lambda pos, n=name: self._preset_menu(n, b.mapToGlobal(pos))
+            )
+        self._preset_flow.addWidget(b)
+
+    def _preset_menu(self, name: str, gpos) -> None:
+        m = QMenu(self)
+        a = QAction(f"删除预设「{name}」", self)
+        a.triggered.connect(lambda: self._drop_preset(name))
+        m.addAction(a)
+        m.exec(gpos)
+
+    def _drop_preset(self, name: str) -> None:
+        if presets.remove_user(name):
+            self.reload_presets()
+
+    def _save_preset(self) -> None:
+        """把设定框当前内容存成一个自定义预设。"""
+        text = self.premise.toPlainText().strip()
+        if not text:
+            QMessageBox.information(self, "存为预设", "设定框还是空的，先写点内容。")
+            return
+        name, ok = QInputDialog.getText(self, "存为预设", "标签名（2-4 字最好记）：")
+        if not ok or not name.strip():
+            return
+        if presets.add_user(name.strip(), text):
+            self.reload_presets()
+
+    def _apply_preset(self, name: str, text: str) -> None:
+        """把预设追加进设定框 —— 追加而非替换，多条可以叠加。"""
+        cur = self.premise.toPlainText().rstrip()
+        merged = (cur + "\n" + text) if cur else text
+        self.premise.setPlainText(merged)
+        cur_txt = self.premise.textCursor()
+        cur_txt.movePosition(QTextCursor.MoveOperation.End)
+        self.premise.setTextCursor(cur_txt)
+        self.preset_applied.emit(merged)
 
     def _notes(self, placeholder: str) -> QPlainTextEdit:
         e = QPlainTextEdit()
@@ -1706,6 +2032,42 @@ class SettingsDialog(QDialog):
         self.font.setValue(getattr(s, "editor_size", 16) or 16)
         add("正文字号", self.font)
 
+        self.glow = QCheckBox("窗口流光边框（呼吸 + 流动描边）")
+        self.glow.setChecked(bool(getattr(s, "glow_border", False)))
+        g.addWidget(self.glow, r, 0, 1, 2)
+        r += 1
+
+        # 边框取色：七彩渐变 / 单色，单色时右侧出现调色板
+        self.glow_rainbow = QCheckBox("七彩渐变")
+        self.glow_rainbow.setChecked(bool(getattr(s, "glow_rainbow", True)))
+        self.glow_rainbow.toggled.connect(self._sync_glow_row)
+
+        self.glow_color = QComboBox()
+        for c in GLOW_PALETTE:
+            self.glow_color.addItem(c)
+            self.glow_color.setItemData(
+                self.glow_color.count() - 1, QColor(c), Qt.ItemDataRole.DecorationRole
+            )
+            self.glow_color.setItemData(
+                self.glow_color.count() - 1, c, Qt.ItemDataRole.UserRole
+            )
+        self.glow_color.setToolTip("单色流光的主色")
+        cur = getattr(s, "glow_color", GLOW_PALETTE[0])
+        idx = GLOW_PALETTE.index(cur) if cur in GLOW_PALETTE else 0
+        self.glow_color.setCurrentIndex(idx)
+
+        grow = QHBoxLayout()
+        grow.setContentsMargins(0, 0, 0, 0)
+        grow.setSpacing(T.GAP_SM)
+        grow.addWidget(self.glow_rainbow)
+        grow.addStretch(1)
+        self._glow_lbl = field_label("主色")
+        grow.addWidget(self._glow_lbl)
+        grow.addWidget(self.glow_color)
+        g.addLayout(grow, r, 0, 1, 2)
+        r += 1
+        self._sync_glow_row()
+
         note = hint(
             "预算以「字」计。正文超出上下文预算后，旧情节会自动压缩进前情记忆。"
             "单章上限控制「一键生成」时自动开新章的字数。\n"
@@ -1728,6 +2090,12 @@ class SettingsDialog(QDialog):
         bar.addWidget(ok)
         g.addLayout(bar, r, 0, 1, 2)
 
+    def _sync_glow_row(self) -> None:
+        """七彩模式下隐藏调色板；单色模式才需要选主色。"""
+        single = not self.glow_rainbow.isChecked()
+        self._glow_lbl.setVisible(single)
+        self.glow_color.setVisible(single)
+
     def result_settings(self) -> Settings:
         # 保留原样、本对话框不涉及的字段：theme / editor_size / reader_*。
         # 直接构造 Settings 会把这些重置为默认值 —— 例如保存设置后配色丢失。
@@ -1738,7 +2106,7 @@ class SettingsDialog(QDialog):
                 "base_url", "api_key", "model", "temperature", "max_tokens",
                 "context_budget", "corpus_budget", "target_chars", "chapter_max",
                 "editor_size", "top_p", "presence_penalty", "frequency_penalty",
-                "auto_review",
+                "auto_review", "glow_border", "glow_rainbow", "glow_color",
             }
         }
         return Settings(
@@ -1757,6 +2125,9 @@ class SettingsDialog(QDialog):
             chapter_max=int(self.chmax.value()),
             editor_size=int(self.font.value()),
             auto_review=bool(self.autorev.isChecked()),
+            glow_border=bool(self.glow.isChecked()),
+            glow_rainbow=bool(self.glow_rainbow.isChecked()),
+            glow_color=str(self.glow_color.currentData() or GLOW_PALETTE[0]),
         )
 
 
@@ -1802,6 +2173,7 @@ class Window(QWidget):
         self._handle: AI.StreamHandle | None = None
         self._busy = False
         self._dirty = False
+        self._loading = False   # 载入画面期间：控件自身的 textChanged 不算改动
         self._stream_target = "paper"
         self._result: ResultDialog | None = None
         self._reader: ReaderWindow | None = None
@@ -1825,7 +2197,8 @@ class Window(QWidget):
         self._pending_summaries: list[str] = []
 
         # ── 布局 ──
-        root = QVBoxLayout(self)
+        self._root = QVBoxLayout(self)
+        root = self._root
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
@@ -1848,6 +2221,13 @@ class Window(QWidget):
         body.addWidget(self.inspector)
         root.addLayout(body, 1)
 
+        # ── 流光呼吸边框（覆盖层，默认关闭）──
+        self.glow = GlowBorder(self)
+        self.glow.setGeometry(self.rect())
+        self.glow.raise_()
+        self._apply_round_mask()
+        self._sync_glow()
+
         # ── 连线 ──
         self.rail.picked.connect(self._pick_chapter)
         self.rail.added.connect(self._add_chapter)
@@ -1868,6 +2248,11 @@ class Window(QWidget):
         self.desk.stop.connect(self._request_stop)
         self.desk.retitled.connect(self._retitle)
         self.desk.paper.textChanged.connect(self._on_text)
+        # 右栏设定与记忆同样是可编辑的手稿：不标脏的话，autosave 看不见它们，
+        # 而切换作品前的「还有未保存的改动」也会直接放行 —— 稿子就这么丢了。
+        self.inspector.premise.textChanged.connect(self._on_notes)
+        self.inspector.preset_applied.connect(self._on_notes)
+        self.inspector.memory.textChanged.connect(self._on_notes)
         self.inspector.add_files.connect(self._pick_files)
         self.inspector.analyze.connect(self._start_analysis)
         self.inspector.expand.connect(self._start_expand)
@@ -1900,6 +2285,15 @@ class Window(QWidget):
 
     def _load_all(self, first: bool = False) -> None:
         p = self.project
+        # 载入期间各控件会触发 textChanged —— 那是程序写的，不是作者敲的。
+        # 不挡住就会像旧版那样：一启动 8 秒后白存一次盘。
+        self._loading = True
+        try:
+            self._load_all_inner(p, first)
+        finally:
+            self._loading = False
+
+    def _load_all_inner(self, p: Project, first: bool) -> None:
         self.rail.load(p.chapters, p.current)
         self.desk.set_chapter(p.chapter)
         self.desk.refresh_meta(p)
@@ -1944,7 +2338,74 @@ class Window(QWidget):
 
         threading.Thread(target=wrapped, daemon=True).start()
 
-    def _save(self) -> None:
+    def _save(self, force_backup: bool = False) -> None:
+        """落盘。
+
+        force_backup=True 时无条件留一份快照（跳过自动备份的节流）——
+        一次生成写完 / 被打断都算得上有意义的还原点，值得单独存档。
+        """
+        self._stash()
+        try:
+            with self._plock:
+                self.project.save(force_backup=force_backup)
+            self._dirty = False
+        except OSError as e:
+            self.desk.set_status(f"保存失败：{e}")
+
+    def _apply_round_mask(self) -> None:
+        """把窗口裁成圆角。
+
+        无边框窗口本身是方的 —— 圆角描边画上去，四角仍是直角。
+        用遮罩把四角切掉，窗口才真正是圆的。
+        """
+        r = int(GlowBorder.CORNER)
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(self.rect()), r, r)
+        self.setMask(QRegion(path.toFillPolygon().toPolygon()))
+
+    def resizeEvent(self, e) -> None:
+        super().resizeEvent(e)
+        self._apply_round_mask()
+        if getattr(self, "glow", None) is not None:
+            self.glow.setGeometry(self.rect())
+            self.glow.raise_()
+
+    def closeEvent(self, e) -> None:
+        # 完整的停止流程（含掐断 socket），否则关闭后连接还会挂到超时
+        if self._busy:
+            self._request_stop()
+        self._save()
+        super().closeEvent(e)
+
+    def _set_busy(self, busy: bool) -> None:
+        """统一的忙碌开关。
+
+        除了切 menubar 状态，还要锁住换章与换作品：流式产出的文字总是写在
+        「当前正在看的那一章」，中途切走的话，剩下的输出会落进另一个作品 /
+        另一章里 —— 而且是流式追加，混进去很难再挑出来。
+        """
+        self._busy = busy
+        self.desk.set_busy(busy)
+        self.rail.list.setEnabled(not busy)
+        self.titlebar.works_btn.setEnabled(not busy)
+
+    def _guard_idle(self) -> bool:
+        """换章 / 换作品前的拦截。理由见 _set_busy。"""
+        if self._busy:
+            self.desk.set_status("正在生成中 —— 先按「停止」再切换")
+            return False
+        return True
+
+    # ══════════════ 章节 ══════════════
+
+    def _stash(self) -> None:
+        """把界面上的编辑并回 project。
+
+        凡是要以 project 为依据做判断的动作 —— 续写装配上下文、统计字数、
+        导出、切换作品 —— 都必须先跑这一遍。autosave 每 8 秒才写一次盘，
+        少了这一步，判断用的是上一次存盘的版本：刚敲进去的字不会进上下文，
+        模型照着旧稿往下接，看起来就是"它又重复了一遍"。
+        """
         p = self.project
         p.chapter.title = self.desk.title.text().strip() or "未命名"
         p.chapter.body = self.desk.paper.body()
@@ -1953,27 +2414,9 @@ class Window(QWidget):
         # 的旧文本盖回去，后台累积的摘要会丢失 —— 跳过，等后台结果回填。
         if not self._bg_memory and not self._busy:
             p.memory = self.inspector.memory.toPlainText()
-        try:
-            with self._plock:
-                p.save()
-            self._dirty = False
-        except OSError as e:
-            self.desk.set_status(f"保存失败：{e}")
-
-    def closeEvent(self, e) -> None:
-        self._stop.set()
-        self._save()
-        super().closeEvent(e)
-
-    # ══════════════ 章节 ══════════════
-
-    def _stash(self) -> None:
-        p = self.project
-        p.chapter.title = self.desk.title.text().strip() or "未命名"
-        p.chapter.body = self.desk.paper.body()
 
     def _pick_chapter(self, row: int) -> None:
-        if row == self.project.current:
+        if row == self.project.current or not self._guard_idle():
             return
         self._stash()
         self.project.current = row
@@ -2005,6 +2448,8 @@ class Window(QWidget):
         self._fade_anim.start()
 
     def _add_chapter(self) -> None:
+        if not self._guard_idle():
+            return
         self._stash()
         p = self.project
         finished = p.chapter.body
@@ -2032,6 +2477,8 @@ class Window(QWidget):
         if len(p.chapters) <= 1:
             self.desk.set_status("至少要保留一章")
             return
+        if not self._guard_idle():
+            return
         if not (0 <= row < len(p.chapters)):
             return
         # 先把编辑中的内容并回 project —— 否则 set_chapter 会用旧数据盖掉
@@ -2058,6 +2505,8 @@ class Window(QWidget):
         p = self.project
         if len(ids) != len(p.chapters):
             return
+        if not self._guard_idle():
+            return
         by_id = {ch.id: ch for ch in p.chapters}
         if any(i not in by_id for i in ids):
             return
@@ -2076,6 +2525,8 @@ class Window(QWidget):
         p = self.project
         n = len(p.chapters)
         if keep_row == drop_row or not (0 <= keep_row < n and 0 <= drop_row < n):
+            return
+        if not self._guard_idle():
             return
         keep_title = p.chapters[keep_row].title
         drop_title = p.chapters[drop_row].title
@@ -2143,6 +2594,12 @@ class Window(QWidget):
         self._dirty = True
         self.desk.refresh_meta(self.project)
         self._meta_timer.start()
+
+    def _on_notes(self, *_ignored) -> None:
+        """右栏「设定 / 记忆」被改动。"""
+        if self._loading:
+            return
+        self._dirty = True
 
     # ══════════════ 语料 ══════════════
 
@@ -2237,6 +2694,22 @@ class Window(QWidget):
     def _forget_result(self) -> None:
         self._result = None
 
+    def _close_panels(self) -> None:
+        """换作品 / 删作品之前，先把挂着旧项目的窗口收掉。
+
+        以前只在切换后把引用置 None —— Qt 仍然持有这些窗口，于是统计窗、
+        版本窗、阅读窗继续挂在屏幕上，显示的却是上一部作品的内容；主窗口
+        已经换人了，看着像同一个程序在同时讲两个故事。
+
+        必须在动磁盘**之前**调用：阅读窗关闭时会写下阅读进度，它持有的是旧
+        项目对象，若这时那部作品已经被删掉，这一存又会把它写回来。
+        """
+        for attr in ("_result", "_stats", "_versions", "_reader"):
+            dlg = getattr(self, attr, None)
+            if dlg is not None:
+                setattr(self, attr, None)   # 先断引用，再关：closeEvent 里的
+                dlg.close()                 # 回调重复置 None 也无害
+
     def _on_version_restored(self, name: str) -> None:
         """快照已写回磁盘，把界面整个重建成那一版的样子。"""
         try:
@@ -2244,8 +2717,7 @@ class Window(QWidget):
         except (OSError, ValueError) as e:
             self.desk.set_status(f"重新载入失败：{e}")
             return
-        if self._versions is not None:
-            self._versions.close()
+        self._close_panels()
         self._after_switch()
         self.desk.set_status(f"已回滚到 {name.split('-', 1)[-1].replace('.json', '')} 这一版")
 
@@ -2268,7 +2740,7 @@ class Window(QWidget):
         self.desk.set_status(f"已更名为《{name}》")
 
     def prompt_new_project(self) -> None:
-        if not self._confirm_discard():
+        if not self._guard_idle() or not self._confirm_discard():
             return
         name, ok = QInputDialog.getText(
             self, "新建作品", "作品名（可留空，之后用「AI 起名」自动命名）：", text=""
@@ -2278,7 +2750,8 @@ class Window(QWidget):
         name = name.strip() or "未命名作品"
         # 先把旧作品落盘 —— 此刻界面里的内容仍属于它。
         # 若在切换后再 _save()，会把旧界面内容写进新项目。
-        self._save()
+        self._close_panels()
+        self._save(force_backup=True)
         old = self.project.settings
         self.project = store.new_project(name)
         self.project.settings = store.Settings(
@@ -2308,6 +2781,11 @@ class Window(QWidget):
         m.addSeparator()
         m.addAction(a_import)
         m.addAction(a_versions)
+        # 报 issue 时第一个要问的就是「哪一版」，放在菜单里免得起 exe 名
+        v = QAction(f"续墨 v{store.APP_VERSION}", self)
+        v.setEnabled(False)
+        m.addSeparator()
+        m.addAction(v)
         btn = self.titlebar.works_btn
         m.exec(btn.mapToGlobal(btn.rect().bottomLeft()))
 
@@ -2325,7 +2803,7 @@ class Window(QWidget):
         return True
 
     def open_project(self) -> None:
-        if not self._confirm_discard():
+        if not self._guard_idle() or not self._confirm_discard():
             return
         items = store.list_projects()
         if not items:
@@ -2336,6 +2814,7 @@ class Window(QWidget):
         if not ok:
             return
         pid = items[labels.index(choice)][0]
+        self._close_panels()
         try:
             self.project = store.open_project(pid)
         except (OSError, ValueError) as e:
@@ -2345,6 +2824,8 @@ class Window(QWidget):
 
     def delete_project(self) -> None:
         """删除一部作品（含备份）。当前作品被删则切到剩余作品或新建。"""
+        if not self._guard_idle():
+            return
 
         items = store.list_projects()
         if not items:
@@ -2370,6 +2851,7 @@ class Window(QWidget):
         # 删当前作品前先落盘，避免 _dirty 触发无谓的重新保存
         if pid == self.project.id:
             self._dirty = False
+        self._close_panels()      # 必须早于 delete：详见 _close_panels 的说明
         store.delete_project(pid)
 
         remaining = store.list_projects()
@@ -2398,9 +2880,10 @@ class Window(QWidget):
         except (OSError, ValueError) as e:
             self.desk.set_status(f"导入失败：{e}")
             return
-        if not self._confirm_discard():
+        if not self._guard_idle() or not self._confirm_discard():
             return
-        self._save()
+        self._close_panels()
+        self._save(force_backup=True)
         incoming.id = store._uid()
         self.project = incoming
         self._after_switch()
@@ -2408,6 +2891,10 @@ class Window(QWidget):
 
     def _after_switch(self) -> None:
         """换了作品之后，把界面整个重建一遍。"""
+        # 先关掉指向旧作品的窗口。只把引用置 None 是不够的：Qt 仍持有它们，
+        # 于是统计窗、版本窗、阅读窗会继续挂在屏幕上，显示上一部作品的内容，
+        # 而主窗口已经换人了 —— 看着像同一个程序同时在讲两个故事。
+        self._close_panels()
         T.set_palette(self.project.settings.theme)
         self._apply_qss()
         self.titlebar.sync_theme_label()
@@ -2525,6 +3012,7 @@ class Window(QWidget):
         T.set_palette(T.next_palette())
         self.project.settings.theme = T.current_palette()
         self._apply_qss()
+        self._sync_glow()
         self.titlebar.sync_theme_label()
         self.desk.refresh_meta(self.project)
         self.desk.set_status(f"配色：{T.label_for(T.current_palette())}")
@@ -2539,8 +3027,28 @@ class Window(QWidget):
             self.desk.refresh_meta(self.project)
             if self.project.settings.target_chars:
                 self.desk.set_target(self.project.settings.target_chars)
+            self._sync_glow()
             self.desk.set_status("设置已保存")
             self._dirty = True
+
+    def _sync_glow(self) -> None:
+        """把设置（开关 / 取色模式 / 单色值）同步给边框，并让出描边占用的边距。"""
+        s = self.project.settings
+        self.glow.configure(
+            rainbow=bool(getattr(s, "glow_rainbow", True)),
+            color=str(getattr(s, "glow_color", GLOW_PALETTE[0]) or GLOW_PALETTE[0]),
+        )
+        # 描边画在窗口边缘内侧，会压住贴边的控件 —— 开启时给内容留出同等边距。
+        pad = int(GlowBorder.THICKNESS) + 2 if s.glow_border else 0
+        self._root.setContentsMargins(pad, pad, pad, pad)
+        if s.glow_border:
+            self.glow.show()
+            self.glow.raise_()
+            self.glow.start()
+        else:
+            self.glow.stop()
+            # 仅停表不够 —— 控件仍可见、仍画最后一帧，于是"关了还有边框"
+            self.glow.hide()
 
     # ══════════════ 续写 ══════════════
 
@@ -2565,6 +3073,10 @@ class Window(QWidget):
     def _start_write(self) -> None:
         if self._busy or not self._guard_key():
             return
+        # 先并回编辑器里的东西：autosave 是 8 秒一跳，直接读 project.chapter.body
+        # 拿到的是上一次存盘的版本 —— 刚敲的字不会进上下文，也不会进"是否走
+        # 开篇模式"的判断（<40 字会被误判成空稿，用续写语气写开篇）。
+        self._stash()
         body = self.project.chapter.body
         # 空稿（或只有零星几字）走开篇模式。
         # 用「续写」语气写开头，模型会把故事当成中段来写，于是永远没有真正的开场。
@@ -2578,8 +3090,7 @@ class Window(QWidget):
         self._stop.clear()
         self._handle = AI.StreamHandle()
         self._pending_delta.clear()   # 上一任务若未排净，别串到这次的内容里
-        self._busy = True
-        self.desk.set_busy(True)
+        self._set_busy(True)
         self.desk.set_status(status)
         self._stream_target = target
         self._rewrite_wrote = False
@@ -2590,7 +3101,6 @@ class Window(QWidget):
             return
         self._stash()
         p = self.project
-        p.premise = self.inspector.premise.toPlainText()
         # 允许全空：没有任何设定时，由 AI 从零发挥。
         if p.chapter.body.strip():
             r = QMessageBox.question(
@@ -2609,9 +3119,7 @@ class Window(QWidget):
             return
         self._stash()
         p = self.project
-        p.premise = self.inspector.premise.toPlainText()
-        self._busy = True
-        self.desk.set_busy(True)
+        self._set_busy(True)
         self.desk.set_status("正在取名…")
 
         def work() -> None:
@@ -2855,8 +3363,7 @@ class Window(QWidget):
 
     def _on_done(self) -> None:
         self._flush_delta()
-        self._busy = False
-        self.desk.set_busy(False)
+        self._set_busy(False)
 
         if self._stream_target == "rewrite":
             self.desk.paper.end_rewrite()
@@ -2865,7 +3372,7 @@ class Window(QWidget):
             self.rail.load(self.project.chapters, self.project.current)
             self.desk.set_status(f"{self._rewrite_label}完成")
             self._dirty = True
-            self._save()
+            self._save(force_backup=True)
             return
 
         if self._stream_target in ("dialog", "reformat", "review"):
@@ -2892,7 +3399,7 @@ class Window(QWidget):
             self._renewed_memory = False
             self.inspector.memory.setPlainText(self.project.memory)
         self._dirty = True
-        self._save()
+        self._save(force_backup=True)
         self._flush_summaries()
         # 一键生成写了大批内容 —— 自动通读一遍，把新出现的人物/设定并进设定。
         # 若还有章节要压缩进记忆，等它完成再分析，避免两个后台任务同时写项目。
@@ -2961,14 +3468,12 @@ class Window(QWidget):
             if name and name not in titles:
                 titles.append(name)
 
-        self._busy = False
-        self.desk.set_busy(False)
+        self._set_busy(False)
 
         if not titles:
             self.desk.set_status("没能解析出书名，请重试")
             return
 
-        cur = self.project.title
         choice, ok = QInputDialog.getItem(
             self, "选择书名", "候选书名：", titles, 0, False
         )
@@ -2998,17 +3503,15 @@ class Window(QWidget):
         box = self.inspector.premise
         box.setPlainText(merged)
         self.project.premise = merged
-        self._busy = False
-        self.desk.set_busy(False)
+        self._set_busy(False)
         self.desk.set_status("设定已自动更新" if auto else "设定已更新")
         self._dirty = True
         self._save()
 
     def _on_failed(self, msg: str) -> None:
         self._flush_delta()
-        self._busy = False
+        self._set_busy(False)
         self._gen_active = False
-        self.desk.set_busy(False)
 
         if self._stream_target in ("dialog", "reformat", "review"):
             if self._result is not None:
@@ -3028,7 +3531,7 @@ class Window(QWidget):
             self.project.chapter.body = self.desk.paper.body()
             self.desk.refresh_meta(self.project)
             self._dirty = True
-            self._save()
+            self._save(force_backup=True)
             self.desk.set_status(note)
             return
 
@@ -3058,8 +3561,7 @@ class Window(QWidget):
             self.desk.set_status("正文太短，无需重排")
             return
 
-        self._busy = True
-        self.desk.set_busy(True)
+        self._set_busy(True)
         self.desk.set_status("正在重排段落…")
         self._stream_target = "reformat"
         p = self.project
@@ -3090,8 +3592,7 @@ class Window(QWidget):
         if len(p.chapter.body.strip()) < 50:
             self.desk.set_status("正文太短，无需审校")
             return
-        self._busy = True
-        self.desk.set_busy(True)
+        self._set_busy(True)
         self.desk.set_status("正在审校正文…")
         self._stream_target = "review"
 
@@ -3141,12 +3642,10 @@ class Window(QWidget):
             return
         self._stash()
         p = self.project
-        p.premise = self.inspector.premise.toPlainText()
         if not p.premise.strip():
             self.desk.set_status("先写几句故事方向，我才有依据补全")
             return
-        self._busy = True
-        self.desk.set_busy(True)
+        self._set_busy(True)
         self.desk.set_status("正在补全设定…")
 
         def work() -> None:
@@ -3169,8 +3668,7 @@ class Window(QWidget):
         if self._busy:
             return
         self._auto_analyzing = auto
-        self._busy = True
-        self.desk.set_busy(True)
+        self._set_busy(True)
         self.desk.set_status("正在通读全文，更新设定…" if auto else "正在通读材料…")
         p = self.project
 
